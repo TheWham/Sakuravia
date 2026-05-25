@@ -498,6 +498,127 @@ class TaskRepository:
             ).fetchall()
         return [self._row_to_bili_event(row) for row in rows]
 
+    def list_bili_events_by_sender_mid(self, sender_mid: str, limit: int = 50) -> list[BiliEventRecord]:
+        """Return one B 站用户触发的最近 @ 事件.
+
+        V2 用户分析页按请求用户 UID 做归档，这里的 UID 必须使用
+        `bili_event.sender_mid`，不要误用 AI 助手账号自己的 `BILI_SELF_MID`。
+        """
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM bili_event
+                WHERE sender_mid = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (sender_mid.strip(), limit),
+            ).fetchall()
+        return [self._row_to_bili_event(row) for row in rows]
+
+    def get_bili_user_stats(self) -> dict[str, dict[str, object]]:
+        """Aggregate B 站用户维度的本地请求状态.
+
+        统计只依赖本机 SQLite 里的事件记录，用来给本地管理页判断某个 UID
+        最近有没有请求、是否已经成功投递，以及最近一次失败原因是什么。
+        """
+        stats: dict[str, dict[str, object]] = {}
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    sender_mid,
+                    COUNT(*) AS event_count,
+                    SUM(CASE WHEN delivery_status = ? THEN 1 ELSE 0 END) AS success_count,
+                    SUM(
+                        CASE
+                            WHEN status IN (?, ?) OR delivery_status = ? THEN 1
+                            ELSE 0
+                        END
+                    ) AS failed_count,
+                    MAX(created_at) AS last_event_at
+                FROM bili_event
+                WHERE sender_mid != ''
+                GROUP BY sender_mid
+                """,
+                (
+                    BiliDeliveryStatus.SENT.value,
+                    BiliEventStatus.FAILED.value,
+                    BiliEventStatus.TASK_FAILED.value,
+                    BiliDeliveryStatus.FAILED.value,
+                ),
+            ).fetchall()
+            error_rows = connection.execute(
+                """
+                SELECT sender_mid, error_message
+                FROM bili_event
+                WHERE sender_mid != '' AND error_message != ''
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            user_rows = connection.execute("SELECT uid FROM bili_user_email").fetchall()
+
+        for row in user_rows:
+            uid = str(row["uid"])
+            stats[uid] = {
+                "event_count": 0,
+                "success_count": 0,
+                "failed_count": 0,
+                "last_event_at": "",
+                "last_error": "",
+            }
+
+        for row in rows:
+            sender_mid = str(row["sender_mid"])
+            stats[sender_mid] = {
+                "event_count": int(row["event_count"] or 0),
+                "success_count": int(row["success_count"] or 0),
+                "failed_count": int(row["failed_count"] or 0),
+                "last_event_at": str(row["last_event_at"] or ""),
+                "last_error": "",
+            }
+
+        for row in error_rows:
+            sender_mid = str(row["sender_mid"])
+            if sender_mid in stats and not stats[sender_mid]["last_error"]:
+                stats[sender_mid]["last_error"] = str(row["error_message"])
+        return stats
+
+    def get_task_summary_map(self, task_ids: list[int]) -> dict[int, dict[str, object]]:
+        """Load lightweight task snapshots for V2 event detail cards.
+
+        事件详情只需要展示任务状态和错误摘要，不返回 Markdown 正文，避免用户分析页
+        轮询时把大段内容反复传回浏览器。
+        """
+        unique_ids = sorted({int(task_id) for task_id in task_ids if task_id})
+        if not unique_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in unique_ids)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, bvid, video_title, status, mail_status, updated_at, error_message
+                FROM summary_task
+                WHERE id IN ({placeholders})
+                """,
+                tuple(unique_ids),
+            ).fetchall()
+
+        summaries: dict[int, dict[str, object]] = {}
+        for row in rows:
+            task_id = int(row["id"])
+            summaries[task_id] = {
+                "id": task_id,
+                "bvid": str(row["bvid"]),
+                "video_title": str(row["video_title"]),
+                "status": str(row["status"]),
+                "mail_status": str(row["mail_status"]),
+                "updated_at": str(row["updated_at"]),
+                "error_message": str(row["error_message"]),
+            }
+        return summaries
+
     def list_open_bili_events(self, limit: int = 100) -> list[BiliEventRecord]:
         """Return events whose linked task status still needs to be synchronized."""
         with closing(self._connect()) as connection:

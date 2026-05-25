@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.models import MailStatus, SummaryResult, TaskStatus, TranscriptResult, VideoMetadata
+from app.models import BiliDeliveryStatus, BiliEventStatus, MailStatus, SummaryResult, TaskStatus, TranscriptResult, VideoMetadata
 from app.storage import TaskRepository
 from app.services.task_service import TaskService
 
@@ -123,6 +123,63 @@ class RepositoryTests(unittest.TestCase):
 
         self.repo.delete_bili_user_email("100")
         self.assertIsNone(self.repo.find_bili_user_email_by_uid("100"))
+
+    def test_bili_events_can_be_listed_by_sender_mid(self) -> None:
+        first = self.repo.create_bili_event_if_absent("n1", "c1", "100", "测试用户", "@ai BV1first")
+        second = self.repo.create_bili_event_if_absent("n2", "c2", "200", "其他用户", "@ai BV1other")
+        third = self.repo.create_bili_event_if_absent("n3", "c3", "100", "测试用户", "@ai BV1third")
+
+        events = self.repo.list_bili_events_by_sender_mid("100")
+
+        self.assertEqual([event.id for event in events], [third.id, first.id])
+        self.assertNotIn(second.id, [event.id for event in events])
+
+    def test_bili_user_stats_count_events_and_failures(self) -> None:
+        self.repo.upsert_bili_user_email("100", "测试用户", "target@example.com")
+        self.repo.upsert_bili_user_email("300", "无事件用户", "empty@example.com")
+        success_event = self.repo.create_bili_event_if_absent("n1", "c1", "100", "测试用户", "@ai BV1success")
+        failed_event = self.repo.create_bili_event_if_absent("n2", "c2", "100", "测试用户", "@ai BV1failed")
+        self.repo.update_bili_event_fields(
+            success_event.id,
+            status=BiliEventStatus.TASK_SUCCESS.value,
+            delivery_status=BiliDeliveryStatus.SENT.value,
+        )
+        self.repo.update_bili_event_fields(
+            failed_event.id,
+            status=BiliEventStatus.FAILED.value,
+            delivery_status=BiliDeliveryStatus.FAILED.value,
+            error_message="未绑定邮箱",
+        )
+
+        stats = self.repo.get_bili_user_stats()
+
+        self.assertEqual(stats["100"]["event_count"], 2)
+        self.assertEqual(stats["100"]["success_count"], 1)
+        self.assertEqual(stats["100"]["failed_count"], 1)
+        self.assertNotEqual(stats["100"]["last_event_at"], "")
+        self.assertEqual(stats["100"]["last_error"], "未绑定邮箱")
+        self.assertEqual(stats["300"]["event_count"], 0)
+        self.assertEqual(stats["300"]["success_count"], 0)
+        self.assertEqual(stats["300"]["failed_count"], 0)
+        self.assertEqual(stats["300"]["last_error"], "")
+
+    def test_task_summary_map_returns_lightweight_task_fields(self) -> None:
+        task = self.repo.create_task("BV1summary", "BV1summary")
+        self.repo.update_task_fields(
+            task.id,
+            status=TaskStatus.FAILED.value,
+            mail_status=MailStatus.FAILED.value,
+            video_title="失败视频",
+            error_message="处理失败",
+        )
+
+        summary = self.repo.get_task_summary_map([task.id, 999])
+
+        self.assertEqual(summary[task.id]["video_title"], "失败视频")
+        self.assertEqual(summary[task.id]["status"], TaskStatus.FAILED.value)
+        self.assertEqual(summary[task.id]["mail_status"], MailStatus.FAILED.value)
+        self.assertEqual(summary[task.id]["error_message"], "处理失败")
+        self.assertNotIn(999, summary)
 
 
 class TaskServiceTests(unittest.TestCase):
