@@ -55,6 +55,11 @@ class AppConfig:
     smtp_use_ssl: bool
     mail_from: str
     mail_to: str
+    bili_enable_listener: bool = False
+    bili_cookie: str = ""
+    bili_self_mid: str = ""
+    bili_poll_interval_seconds: int = 60
+    bili_request_timeout_seconds: int = 15
 
     @classmethod
     def load(cls, env_path: Path | None = None) -> "AppConfig":
@@ -88,6 +93,11 @@ class AppConfig:
             smtp_use_ssl=_get_setting("SMTP_USE_SSL", file_values, "true").lower() == "true",
             mail_from=_get_setting("MAIL_FROM", file_values),
             mail_to=_get_setting("MAIL_TO", file_values),
+            bili_enable_listener=_get_setting("BILI_ENABLE_LISTENER", file_values, "false").lower() == "true",
+            bili_cookie=_get_setting("BILI_COOKIE", file_values),
+            bili_self_mid=_get_setting("BILI_SELF_MID", file_values),
+            bili_poll_interval_seconds=int(_get_setting("BILI_POLL_INTERVAL_SECONDS", file_values, "60")),
+            bili_request_timeout_seconds=int(_get_setting("BILI_REQUEST_TIMEOUT_SECONDS", file_values, "15")),
         )
 
     def ensure_directories(self) -> None:
