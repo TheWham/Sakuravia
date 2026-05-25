@@ -79,3 +79,6 @@ class MailServiceTests(unittest.TestCase):
             self.assertEqual(len(attachments), 1)
             self.assertEqual(attachments[0].get_filename(), "result.md")
             self.assertEqual(attachments[0].get_payload(decode=True).decode("utf-8").strip(), "# 标题")
+
+            override_message = service.build_message("测试视频", markdown, attachment, to_email="bound@example.com")
+            self.assertEqual(override_message["To"], "bound@example.com")

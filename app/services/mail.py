@@ -17,11 +17,17 @@ class MailService:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
-    def build_message(self, subject_title: str, markdown_content: str, attachment_path: Path) -> EmailMessage:
+    def build_message(
+        self,
+        subject_title: str,
+        markdown_content: str,
+        attachment_path: Path,
+        to_email: str | None = None,
+    ) -> EmailMessage:
         """Create a readable mail body while keeping the Markdown file as an attachment."""
         message = EmailMessage()
         message["From"] = self._config.mail_from
-        message["To"] = self._config.mail_to
+        message["To"] = to_email or self._config.mail_to
         message["Subject"] = f"B站视频总结 - {subject_title}"
         message.set_content(
             "\n".join(
@@ -41,9 +47,15 @@ class MailService:
         )
         return message
 
-    def send_markdown(self, subject_title: str, markdown_content: str, attachment_path: Path) -> None:
+    def send_markdown(
+        self,
+        subject_title: str,
+        markdown_content: str,
+        attachment_path: Path,
+        to_email: str | None = None,
+    ) -> None:
         """Connect to SMTP and send the message using SSL or STARTTLS."""
-        message = self.build_message(subject_title, markdown_content, attachment_path)
+        message = self.build_message(subject_title, markdown_content, attachment_path, to_email=to_email)
         if self._config.smtp_use_ssl:
             with smtplib.SMTP_SSL(self._config.smtp_host, self._config.smtp_port) as client:
                 client.login(self._config.smtp_username, self._config.smtp_password)

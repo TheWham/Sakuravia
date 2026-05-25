@@ -9,11 +9,13 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .config import AppConfig
+from .models import TaskStatus
 from .storage import TaskRepository
 from .utils import ValidationError
 from .services.artifact import ArtifactService
 from .services.audio import SubtitleOrAudioService
 from .services.bili import BiliResolverService
+from .services.bili_listener import BiliAuthService, BiliEventService, BiliHttpClient, BiliMentionApi, BiliMentionPoller
 from .services.http_client import SimpleHttpClient
 from .services.mail import MailService
 from .services.process_runner import ProcessRunner
@@ -32,6 +34,14 @@ class VideoOptionsRequest(BaseModel):
     """Incoming JSON payload for checking selectable video parts."""
 
     source: str
+
+
+class BiliUserEmailRequest(BaseModel):
+    """Incoming JSON payload for a local B 站用户邮箱 binding."""
+
+    uid: str
+    username: str
+    email: str
 
 
 def build_app() -> FastAPI:
@@ -59,17 +69,38 @@ def build_app() -> FastAPI:
         artifact_service=artifact_service,
         mail_service=mail_service,
     )
+    task_service.recover_interrupted_tasks()
+    bili_http_client = BiliHttpClient(config)
+    bili_auth_service = BiliAuthService(bili_http_client)
+    bili_mention_api = BiliMentionApi(bili_http_client, config.bili_self_mid)
+    bili_event_service = BiliEventService(repository, task_service, mail_service)
+    bili_poller = BiliMentionPoller(config, bili_auth_service, bili_mention_api, bili_event_service)
 
     app = FastAPI(title="个人版 B 站 AI 助手", version="1.0.0")
     app.state.task_service = task_service
+    app.state.bili_poller = bili_poller
+    app.state.bili_event_service = bili_event_service
     app.state.config = config
+
+    @app.on_event("startup")
+    def start_bili_listener() -> None:
+        """Start the optional B 站 listener after FastAPI finishes booting."""
+        bili_poller.start()
+
+    @app.on_event("shutdown")
+    def stop_bili_listener() -> None:
+        """Stop the B 站 listener so the process exits cleanly."""
+        bili_poller.stop()
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         """Render the single-page local UI."""
         tasks = [task.to_dict() for task in task_service.list_tasks()]
         selected = tasks[0] if tasks else None
-        return HTMLResponse(_render_index_html(tasks, selected))
+        listener_state = bili_poller.snapshot().to_dict()
+        bili_events = [event.to_dict() for event in repository.list_bili_events()]
+        bili_users = [user.to_dict() for user in repository.list_bili_user_emails()]
+        return HTMLResponse(_render_index_html(tasks, selected, listener_state, bili_events, bili_users))
 
     @app.post("/api/tasks")
     def create_task(payload: TaskCreateRequest) -> dict[str, object]:
@@ -94,6 +125,47 @@ def build_app() -> FastAPI:
         """Return the latest tasks for page polling."""
         return {"tasks": [task.to_dict() for task in task_service.list_tasks()]}
 
+    @app.post("/api/tasks/{task_id}/retry")
+    def retry_task(task_id: int) -> dict[str, object]:
+        """Retry one failed task while keeping reusable local artifacts."""
+        try:
+            task = task_service.retry_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在。") from exc
+        return {"task_id": task.id, "task": task.to_dict()}
+
+    @app.get("/api/bili-listener")
+    def get_bili_listener() -> dict[str, object]:
+        """Return B 站 listener state and recent mention events."""
+        bili_event_service.sync_task_statuses()
+        return {
+            "state": bili_poller.snapshot().to_dict(),
+            "events": [event.to_dict() for event in repository.list_bili_events()],
+        }
+
+    @app.get("/api/bili-users")
+    def list_bili_users() -> dict[str, object]:
+        """Return local B 站用户邮箱 bindings."""
+        return {"users": [user.to_dict() for user in repository.list_bili_user_emails()]}
+
+    @app.post("/api/bili-users")
+    def upsert_bili_user(payload: BiliUserEmailRequest) -> dict[str, object]:
+        """Create or update one local B 站用户邮箱 binding."""
+        uid = payload.uid.strip()
+        email = payload.email.strip()
+        if not uid:
+            raise HTTPException(status_code=400, detail="请输入 B 站用户 UID。")
+        if not email or "@" not in email:
+            raise HTTPException(status_code=400, detail="请输入有效邮箱。")
+        user = repository.upsert_bili_user_email(uid, payload.username, email)
+        return {"user": user.to_dict()}
+
+    @app.delete("/api/bili-users/{uid}")
+    def delete_bili_user(uid: str) -> dict[str, object]:
+        """Delete one local B 站用户邮箱 binding."""
+        repository.delete_bili_user_email(uid)
+        return {"ok": True}
+
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: int) -> dict[str, object]:
         """Return one task with the full Markdown content and error state."""
@@ -106,7 +178,13 @@ def build_app() -> FastAPI:
     return app
 
 
-def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, object] | None) -> str:
+def _render_index_html(
+    tasks: list[dict[str, object]],
+    selected: dict[str, object] | None,
+    listener_state: dict[str, object],
+    bili_events: list[dict[str, object]],
+    bili_users: list[dict[str, object]],
+) -> str:
     """Render a lightweight HTML page without adding a template dependency."""
     selected_markdown = escape(str((selected or {}).get("markdown_content", "")))
     selected_path = escape(str((selected or {}).get("markdown_file_path", "")))
@@ -114,6 +192,7 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
     selected_title = escape(str((selected or {}).get("video_title", "")))
     selected_status = escape(str((selected or {}).get("status", "")))
     selected_mail_status = escape(str((selected or {}).get("mail_status", "")))
+    retry_display = "" if selected_status == TaskStatus.FAILED.value else "display:none;"
 
     items = []
     for task in tasks:
@@ -129,6 +208,11 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
             )
         )
     task_html = "\n".join(items) or '<div class="empty">还没有任务，先提交一个视频。</div>'
+    listener_status = escape(str(listener_state.get("login_status", "UNKNOWN")))
+    listener_running = "运行中" if listener_state.get("running") else "未运行"
+    listener_error = escape(str(listener_state.get("last_error", "")))
+    event_html = _render_bili_event_html(bili_events)
+    user_html = _render_bili_user_html(bili_users)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -212,6 +296,15 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       font-size: 14px;
       cursor: pointer;
     }}
+    button.secondary {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--text);
+      font-size: 14px;
+      cursor: pointer;
+    }}
     .part-panel {{
       display: none;
       border: 1px solid var(--line);
@@ -254,6 +347,59 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       gap: 8px;
       max-height: 58vh;
       overflow: auto;
+    }}
+    .listener {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .event-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 240px;
+      overflow: auto;
+    }}
+    .event-item {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .event-item.active {{
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }}
+    .user-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 220px;
+      overflow: auto;
+    }}
+    .user-item {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+    }}
+    .delete-user {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--danger);
+      padding: 8px 10px;
+      cursor: pointer;
     }}
     .task-item {{
       width: 100%;
@@ -336,6 +482,25 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
         <div class="meta-line" id="part-panel-title">选择要处理的视频条目</div>
         <div id="part-list" class="part-list"></div>
       </div>
+      <div class="listener">
+        <div class="sub">B 站监听</div>
+        <div class="meta-line">状态：<span id="bili-login-status">{listener_status}</span> / <span id="bili-running-status">{listener_running}</span></div>
+        <div class="meta-line">账号：<span id="bili-account">暂无</span></div>
+        <div class="meta-line">最近轮询：<span id="bili-last-poll">暂无</span></div>
+        <div id="bili-error" class="danger">{listener_error or "无"}</div>
+        <div id="bili-event-list" class="event-list">{event_html}</div>
+      </div>
+      <div class="listener">
+        <div class="sub">用户邮箱簿</div>
+        <form id="bili-user-form">
+          <input id="bili-user-uid" name="uid" placeholder="B 站用户 UID，例如 123456" />
+          <input id="bili-user-name" name="username" placeholder="用户名，例如 测试用户" />
+          <input id="bili-user-email" name="email" placeholder="邮箱，例如 user@example.com" />
+          <button class="submit" type="submit">保存绑定</button>
+          <div id="bili-user-message" class="meta-line"></div>
+        </form>
+        <div id="bili-user-list" class="user-list">{user_html}</div>
+      </div>
       <div class="sub">最近任务</div>
       <div id="task-list" class="tasks">{task_html}</div>
     </section>
@@ -361,6 +526,7 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       <div>
         <div class="meta-line">错误信息</div>
         <div id="task-error" class="danger">{selected_error or "无"}</div>
+        <button id="retry-task-button" class="secondary" type="button" style="margin-top:10px;{retry_display}">重试当前任务</button>
       </div>
       <div>
         <div class="meta-line">Markdown 预览</div>
@@ -381,6 +547,24 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
         selectedTaskId = payload.tasks[0].id;
         await fetchTaskDetail(selectedTaskId);
       }}
+    }}
+
+    async function fetchBiliListener() {{
+      const response = await fetch('/api/bili-listener');
+      if (!response.ok) {{
+        return;
+      }}
+      const payload = await response.json();
+      renderBiliListener(payload.state || {{}}, payload.events || []);
+    }}
+
+    async function fetchBiliUsers() {{
+      const response = await fetch('/api/bili-users');
+      if (!response.ok) {{
+        return;
+      }}
+      const payload = await response.json();
+      renderBiliUsers(payload.users || []);
     }}
 
     function renderTaskList(tasks) {{
@@ -408,6 +592,66 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       }});
     }}
 
+    function renderBiliListener(state, events) {{
+      document.getElementById('bili-login-status').textContent = state.login_status || 'UNKNOWN';
+      document.getElementById('bili-running-status').textContent = state.running ? '运行中' : '未运行';
+      document.getElementById('bili-account').textContent = state.account_name
+        ? `${{state.account_name}} (${{state.account_mid || 'unknown'}})`
+        : '暂无';
+      document.getElementById('bili-last-poll').textContent = state.last_poll_at || '暂无';
+      document.getElementById('bili-error').textContent = state.last_error || '无';
+
+      const container = document.getElementById('bili-event-list');
+      if (!events.length) {{
+        container.innerHTML = '<div class="empty">暂无 B 站 @ 事件。</div>';
+        return;
+      }}
+      container.innerHTML = events.slice(0, 10).map((event) => {{
+        const taskId = event.task_id || '';
+        const active = taskId && Number(taskId) === selectedTaskId ? 'active' : '';
+        return `
+          <button class="event-item ${{active}}" type="button" data-task-id="${{taskId}}">
+            <div class="task-title">${{escapeHtml(event.sender_name || event.sender_mid || '未知用户')}}</div>
+            <div class="task-meta">${{escapeHtml(event.status || '')}} / ${{escapeHtml(event.delivery_status || '')}} #${{escapeHtml(event.bvid || '')}}</div>
+            <div class="task-meta">UID ${{escapeHtml(event.sender_mid || '')}} · ${{escapeHtml(event.recipient_email || '未绑定邮箱')}}</div>
+            <div class="task-meta">${{escapeHtml(event.content || '')}}</div>
+          </button>
+        `;
+      }}).join('');
+      container.querySelectorAll('[data-task-id]').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          if (!button.dataset.taskId) {{
+            return;
+          }}
+          selectedTaskId = Number(button.dataset.taskId);
+          await fetchTaskDetail(selectedTaskId);
+        }});
+      }});
+    }}
+
+    function renderBiliUsers(users) {{
+      const container = document.getElementById('bili-user-list');
+      if (!users.length) {{
+        container.innerHTML = '<div class="empty">暂无用户邮箱绑定。</div>';
+        return;
+      }}
+      container.innerHTML = users.map((user) => `
+        <div class="user-item">
+          <div>
+            <div class="task-title">${{escapeHtml(user.username || '未命名用户')}}</div>
+            <div class="task-meta">UID ${{escapeHtml(user.uid)}} · ${{escapeHtml(user.email)}}</div>
+          </div>
+          <button class="delete-user" type="button" data-uid="${{escapeHtml(user.uid)}}">删除</button>
+        </div>
+      `).join('');
+      container.querySelectorAll('[data-uid]').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          await fetch(`/api/bili-users/${{encodeURIComponent(button.dataset.uid)}}`, {{ method: 'DELETE' }});
+          await fetchBiliUsers();
+        }});
+      }});
+    }}
+
     async function fetchTaskDetail(taskId) {{
       const response = await fetch(`/api/tasks/${{taskId}}`);
       if (!response.ok) {{
@@ -421,6 +665,7 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       document.getElementById('task-path').textContent = task.markdown_file_path || '暂无';
       document.getElementById('task-error').textContent = task.error_message || '无';
       document.getElementById('markdown-preview').textContent = task.markdown_content || '暂无结果';
+      document.getElementById('retry-task-button').style.display = task.status === 'FAILED' ? 'inline-block' : 'none';
     }}
 
     function escapeHtml(value) {{
@@ -516,11 +761,111 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       await createTaskFromSource(parts[0]?.url || source);
     }});
 
+    document.getElementById('bili-user-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const message = document.getElementById('bili-user-message');
+      const uid = document.getElementById('bili-user-uid').value.trim();
+      const username = document.getElementById('bili-user-name').value.trim();
+      const email = document.getElementById('bili-user-email').value.trim();
+      if (!uid || !email) {{
+        message.textContent = '请输入 UID 和邮箱。';
+        return;
+      }}
+      const response = await fetch('/api/bili-users', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ uid, username, email }})
+      }});
+      const payload = await response.json();
+      if (!response.ok) {{
+        message.textContent = payload.detail || '保存失败。';
+        return;
+      }}
+      document.getElementById('bili-user-uid').value = '';
+      document.getElementById('bili-user-name').value = '';
+      document.getElementById('bili-user-email').value = '';
+      message.textContent = '绑定已保存。';
+      await fetchBiliUsers();
+    }});
+
+    document.getElementById('retry-task-button').addEventListener('click', async () => {{
+      if (!selectedTaskId) {{
+        return;
+      }}
+      const response = await fetch(`/api/tasks/${{selectedTaskId}}/retry`, {{ method: 'POST' }});
+      if (response.ok) {{
+        await fetchTaskDetail(selectedTaskId);
+        await fetchTasks();
+      }}
+    }});
+
     fetchTasks();
-    setInterval(fetchTasks, 4000);
+    fetchBiliListener();
+    fetchBiliUsers();
+    setInterval(async () => {{
+      await fetchTasks();
+      await fetchBiliListener();
+      await fetchBiliUsers();
+    }}, 4000);
   </script>
 </body>
 </html>"""
+
+
+def _render_bili_event_html(events: list[dict[str, object]]) -> str:
+    """Render recent B 站 events for the first page load."""
+    if not events:
+        return '<div class="empty">暂无 B 站 @ 事件。</div>'
+
+    items = []
+    for event in events[:10]:
+        sender = escape(str(event.get("sender_name") or event.get("sender_mid") or "未知用户"))
+        content = escape(str(event.get("content") or ""))
+        status = escape(str(event.get("status") or ""))
+        delivery_status = escape(str(event.get("delivery_status") or ""))
+        sender_mid = escape(str(event.get("sender_mid") or ""))
+        recipient_email = escape(str(event.get("recipient_email") or "未绑定邮箱"))
+        task_id = escape(str(event.get("task_id") or ""))
+        data_task = f' data-task-id="{task_id}"' if task_id else ""
+        items.append(
+            "\n".join(
+                [
+                    f'<button class="event-item"{data_task} type="button">',
+                    f'  <div class="task-title">{sender}</div>',
+                    f'  <div class="task-meta">{status} / {delivery_status}</div>',
+                    f'  <div class="task-meta">UID {sender_mid} · {recipient_email}</div>',
+                    f'  <div class="task-meta">{content}</div>',
+                    "</button>",
+                ]
+            )
+        )
+    return "\n".join(items)
+
+
+def _render_bili_user_html(users: list[dict[str, object]]) -> str:
+    """Render the local UID to email bindings for the first page load."""
+    if not users:
+        return '<div class="empty">暂无用户邮箱绑定。</div>'
+
+    items = []
+    for user in users[:20]:
+        uid = escape(str(user.get("uid") or ""))
+        username = escape(str(user.get("username") or "未命名用户"))
+        email = escape(str(user.get("email") or ""))
+        items.append(
+            "\n".join(
+                [
+                    '<div class="user-item">',
+                    "  <div>",
+                    f'    <div class="task-title">{username}</div>',
+                    f'    <div class="task-meta">UID {uid} · {email}</div>',
+                    "  </div>",
+                    f'  <button class="delete-user" type="button" data-uid="{uid}">删除</button>',
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(items)
 
 
 app = build_app()
