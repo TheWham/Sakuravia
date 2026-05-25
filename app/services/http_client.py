@@ -7,11 +7,15 @@ import mimetypes
 import uuid
 from pathlib import Path
 from urllib import request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 class HttpRequestError(RuntimeError):
     """Raised when a remote API returns an error response."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class SimpleHttpClient:
@@ -67,7 +71,9 @@ class SimpleHttpClient:
                 return response.read().decode("utf-8")
         except HTTPError as exc:
             message = exc.read().decode("utf-8", errors="ignore")
-            raise HttpRequestError(message or str(exc)) from exc
+            raise HttpRequestError(message or str(exc), status_code=exc.code) from exc
+        except URLError as exc:
+            raise HttpRequestError(f"网络请求失败：{exc.reason}") from exc
 
     def _add_default_headers(self, req: request.Request) -> None:
         """Use a normal client fingerprint so API gateways do not reject urllib's default UA."""
@@ -81,4 +87,6 @@ class SimpleHttpClient:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             message = exc.read().decode("utf-8", errors="ignore")
-            raise HttpRequestError(message or str(exc)) from exc
+            raise HttpRequestError(message or str(exc), status_code=exc.code) from exc
+        except URLError as exc:
+            raise HttpRequestError(f"网络请求失败：{exc.reason}") from exc

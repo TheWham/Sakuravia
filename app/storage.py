@@ -64,6 +64,8 @@ class TaskRepository:
                     mail_status TEXT NOT NULL,
                     send_mail INTEGER NOT NULL DEFAULT 1,
                     retry_count INTEGER NOT NULL DEFAULT 0,
+                    auto_retry_count INTEGER NOT NULL DEFAULT 0,
+                    manual_retry_count INTEGER NOT NULL DEFAULT 0,
                     last_checkpoint TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -73,6 +75,8 @@ class TaskRepository:
             )
             self._ensure_column(connection, "summary_task", "send_mail", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(connection, "summary_task", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "summary_task", "auto_retry_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "summary_task", "manual_retry_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "summary_task", "last_checkpoint", "TEXT NOT NULL DEFAULT ''")
             connection.execute(
                 """
@@ -257,7 +261,7 @@ class TaskRepository:
                 connection.commit()
         return [self._row_to_record(row) for row in rows]
 
-    def prepare_interrupted_tasks_for_retry(self, max_retry_count: int = 2) -> list[TaskRecord]:
+    def prepare_interrupted_tasks_for_retry(self, max_auto_retry_count: int = 2) -> list[TaskRecord]:
         """Move stale running tasks back to PENDING so the new process can retry them.
 
         The app uses an in-process worker thread. If the process is restarted,
@@ -280,8 +284,8 @@ class TaskRepository:
             ).fetchall()
             for row in rows:
                 task_id = int(row["id"])
-                retry_count = int(row["retry_count"])
-                if retry_count < max_retry_count:
+                auto_retry_count = int(row["auto_retry_count"])
+                if auto_retry_count < max_auto_retry_count:
                     retryable_ids.append(task_id)
                 else:
                     failed_ids.append(task_id)
@@ -293,7 +297,7 @@ class TaskRepository:
                     UPDATE summary_task
                     SET status = ?,
                         mail_status = ?,
-                        retry_count = retry_count + 1,
+                        auto_retry_count = auto_retry_count + 1,
                         last_checkpoint = ?,
                         error_message = '',
                         updated_at = ?
@@ -344,7 +348,7 @@ class TaskRepository:
             task_id,
             status=TaskStatus.PENDING.value,
             mail_status=MailStatus.PENDING.value,
-            retry_count=task.retry_count + 1,
+            manual_retry_count=task.manual_retry_count + 1,
             last_checkpoint="manual_retry",
             error_message="",
         )
@@ -701,6 +705,8 @@ class TaskRepository:
             mail_status=MailStatus(str(row["mail_status"])),
             send_mail=bool(row["send_mail"]),
             retry_count=int(row["retry_count"]),
+            auto_retry_count=int(row["auto_retry_count"]),
+            manual_retry_count=int(row["manual_retry_count"]),
             last_checkpoint=str(row["last_checkpoint"]),
             error_message=str(row["error_message"]),
             created_at=str(row["created_at"]),

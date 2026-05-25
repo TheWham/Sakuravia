@@ -65,9 +65,53 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual([task.id for task in retryable], [active.id])
         self.assertEqual(active_after.status, TaskStatus.PENDING)
         self.assertEqual(active_after.mail_status, MailStatus.PENDING)
-        self.assertEqual(active_after.retry_count, 1)
+        self.assertEqual(active_after.auto_retry_count, 1)
+        self.assertEqual(active_after.manual_retry_count, 0)
+        self.assertEqual(active_after.retry_count, 0)
         self.assertEqual(active_after.last_checkpoint, "startup_retry")
         self.assertEqual(done_after.status, TaskStatus.SUCCESS)
+
+    def test_interrupted_tasks_fail_after_auto_retry_limit(self) -> None:
+        active = self.repo.create_task("BV1active", "BV1active")
+        self.repo.update_task_fields(
+            active.id,
+            status=TaskStatus.DOWNLOADING_AUDIO.value,
+            mail_status=MailStatus.PENDING.value,
+            auto_retry_count=2,
+        )
+
+        retryable = self.repo.prepare_interrupted_tasks_for_retry()
+        active_after = self.repo.get_task(active.id)
+
+        self.assertEqual(retryable, [])
+        self.assertEqual(active_after.status, TaskStatus.FAILED)
+        self.assertEqual(active_after.mail_status, MailStatus.FAILED)
+        self.assertEqual(active_after.auto_retry_count, 2)
+        self.assertEqual(active_after.manual_retry_count, 0)
+        self.assertEqual(active_after.last_checkpoint, "retry_exhausted")
+        self.assertIn("自动重试次数已用完", active_after.error_message)
+
+    def test_reset_task_for_retry_only_increments_manual_count(self) -> None:
+        task = self.repo.create_task("BV1manual", "BV1manual")
+        self.repo.update_task_fields(
+            task.id,
+            status=TaskStatus.FAILED.value,
+            mail_status=MailStatus.FAILED.value,
+            retry_count=5,
+            auto_retry_count=1,
+            manual_retry_count=3,
+            error_message="上次处理失败",
+        )
+
+        retried = self.repo.reset_task_for_retry(task.id)
+
+        self.assertEqual(retried.status, TaskStatus.PENDING)
+        self.assertEqual(retried.mail_status, MailStatus.PENDING)
+        self.assertEqual(retried.auto_retry_count, 1)
+        self.assertEqual(retried.manual_retry_count, 4)
+        self.assertEqual(retried.retry_count, 5)
+        self.assertEqual(retried.last_checkpoint, "manual_retry")
+        self.assertEqual(retried.error_message, "")
 
     def test_failed_bili_events_reopen_when_task_is_retried(self) -> None:
         task = self.repo.create_task("BV1event", "BV1event")
