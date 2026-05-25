@@ -1,0 +1,46 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local runtime data
+data/*.db
+data/*.db-journal
+data/*.sqlite
+data/*.sqlite3
+data/*.log
+data/audio/
+data/output/
+data/tmp/
+data/db-backup-*/
+
+# Ad-hoc local smoke-test artifacts
+runtime-test/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
