@@ -85,6 +85,9 @@ class FakeBiliService:
             webpage_url=f"https://www.bilibili.com/video/{bvid}",
         )
 
+    def fetch_metadata_for_source(self, bvid: str, source_input: str) -> VideoMetadata:
+        return self.fetch_metadata(bvid)
+
     def fetch_subtitles(self, metadata: VideoMetadata) -> TranscriptResult:
         return TranscriptResult(source="official_subtitle", full_text="第一段\n第二段")
 

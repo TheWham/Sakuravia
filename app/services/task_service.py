@@ -40,7 +40,7 @@ class TaskService:
     def submit_task(self, source_input: str) -> TaskRecord:
         """Create or reuse a task and make sure new work is scheduled exactly once."""
         bvid = self._bili_service.normalize_source(source_input)
-        active = self._repository.find_active_task_by_bvid(bvid)
+        active = self._repository.find_active_task_by_bvid(bvid, source_input.strip())
         if active is not None:
             return active
 
@@ -62,7 +62,7 @@ class TaskService:
             task = self._repository.get_task(task_id)
 
             self._set_status(task_id, TaskStatus.RESOLVING_VIDEO)
-            metadata = self._bili_service.fetch_metadata(task.bvid)
+            metadata = self._bili_service.fetch_metadata_for_source(task.bvid, task.source_input)
             self._repository.update_task_fields(task_id, video_title=metadata.title)
 
             self._set_status(task_id, TaskStatus.FETCHING_SUBTITLE)

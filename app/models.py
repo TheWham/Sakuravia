@@ -46,6 +46,20 @@ class VideoMetadata:
 
 
 @dataclass(slots=True)
+class VideoPart:
+    """One selectable entry from a Bilibili single video, multi-part video, or collection."""
+
+    index: int
+    title: str
+    duration: int
+    url: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Expose a stable JSON shape for the page selection panel."""
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class TranscriptSegment:
     """One ordered chunk of transcript text."""
 

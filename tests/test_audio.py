@@ -39,6 +39,7 @@ class AudioDownloadTests(unittest.TestCase):
             self.assertEqual(audio_path.parent.parent, target_dir)
             self.assertTrue(audio_path.parent.name.startswith("run_"))
             self.assertIn("--no-part", runner.args)
+            self.assertIn("--no-playlist", runner.args)
             self.assertIn("--force-overwrites", runner.args)
             self.assertIn("--ffmpeg-location", runner.args)
             self.assertIn(str(Path(config.ffmpeg_bin).parent), runner.args)
@@ -51,7 +52,7 @@ class FakeProcessRunner:
         self.audio_dir = audio_dir
         self.args: list[str] = []
 
-    def run(self, args: list[str], cwd: Path | None = None) -> str:
+    def run(self, args: list[str], cwd: Path | None = None, timeout_seconds: int | None = None) -> str:
         self.args = args
         output_template = Path(args[args.index("-o") + 1])
         output_template.with_suffix(".m4a").write_bytes(b"audio")

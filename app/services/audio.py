@@ -11,6 +11,10 @@ from ..models import VideoMetadata
 from .process_runner import ProcessRunner
 
 
+AUDIO_DOWNLOAD_TIMEOUT_SECONDS = 3600
+AUDIO_SPLIT_TIMEOUT_SECONDS = 1200
+
+
 class SubtitleOrAudioService:
     """Handle the file-based side of the fallback branch when subtitles are missing."""
 
@@ -38,6 +42,7 @@ class SubtitleOrAudioService:
             [
                 self._config.yt_dlp_bin,
                 "-x",
+                "--no-playlist",
                 "--audio-format",
                 "m4a",
                 "--ffmpeg-location",
@@ -47,7 +52,8 @@ class SubtitleOrAudioService:
                 "-o",
                 str(output_template),
                 metadata.webpage_url,
-            ]
+            ],
+            timeout_seconds=AUDIO_DOWNLOAD_TIMEOUT_SECONDS,
         )
 
         audio_files = sorted(run_dir.glob(f"{metadata.bvid}.*"))
@@ -74,7 +80,8 @@ class SubtitleOrAudioService:
                 "-c",
                 "copy",
                 str(output_pattern),
-            ]
+            ],
+            timeout_seconds=AUDIO_SPLIT_TIMEOUT_SECONDS,
         )
 
         chunks = sorted(target_dir.glob("chunk_*.m4a"))

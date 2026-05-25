@@ -83,8 +83,8 @@ class TaskRepository:
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
-    def find_active_task_by_bvid(self, bvid: str) -> TaskRecord | None:
-        """Reuse an unfinished task so repeated submissions do not trigger duplicate work."""
+    def find_active_task_by_bvid(self, bvid: str, source_input: str | None = None) -> TaskRecord | None:
+        """Reuse unfinished work while allowing different selected parts to run separately."""
         active_statuses = (
             TaskStatus.PENDING.value,
             TaskStatus.RESOLVING_VIDEO.value,
@@ -96,16 +96,28 @@ class TaskRepository:
             TaskStatus.SENDING_MAIL.value,
         )
         placeholders = ",".join("?" for _ in active_statuses)
+        source_text = (source_input or "").strip()
         with closing(self._connect()) as connection:
-            row = connection.execute(
-                f"""
-                SELECT * FROM summary_task
-                WHERE bvid = ? AND status IN ({placeholders})
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (bvid, *active_statuses),
-            ).fetchone()
+            if source_text:
+                row = connection.execute(
+                    f"""
+                    SELECT * FROM summary_task
+                    WHERE bvid = ? AND source_input = ? AND status IN ({placeholders})
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (bvid, source_text, *active_statuses),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    f"""
+                    SELECT * FROM summary_task
+                    WHERE bvid = ? AND status IN ({placeholders})
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (bvid, *active_statuses),
+                ).fetchone()
         if row is None:
             return None
         return self._row_to_record(row)

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..config import AppConfig
-from ..models import TranscriptResult, TranscriptSegment, VideoMetadata
+from ..models import TranscriptResult, TranscriptSegment, VideoMetadata, VideoPart
 from ..utils import normalize_bilibili_source
 from .process_runner import ProcessRunner
+
+
+METADATA_FETCH_TIMEOUT_SECONDS = 180
+SUBTITLE_FETCH_TIMEOUT_SECONDS = 300
 
 
 class BiliResolverService:
@@ -24,14 +29,19 @@ class BiliResolverService:
 
     def fetch_metadata(self, bvid: str) -> VideoMetadata:
         """Ask yt-dlp for video metadata, subtitles, and fallback information."""
-        url = f"https://www.bilibili.com/video/{bvid}"
+        return self.fetch_metadata_for_source(bvid, f"https://www.bilibili.com/video/{bvid}")
+
+    def fetch_metadata_for_source(self, bvid: str, source_input: str) -> VideoMetadata:
+        """Ask yt-dlp for metadata for a concrete video URL or BV id."""
+        url = self._build_video_url(bvid, source_input)
         output = self._process_runner.run(
             [
                 self._config.yt_dlp_bin,
                 "--dump-single-json",
                 "--no-playlist",
                 url,
-            ]
+            ],
+            timeout_seconds=METADATA_FETCH_TIMEOUT_SECONDS,
         )
         payload = json.loads(output)
 
@@ -61,6 +71,27 @@ class BiliResolverService:
             subtitle_candidates=subtitle_candidates,
         )
 
+    def inspect_parts(self, source: str) -> tuple[str, str, list[VideoPart]]:
+        """Return selectable entries before creating a task.
+
+        普通单视频只会返回一个条目；多 P 或合集会返回多个条目，前端据此让用户
+        手动选择要处理哪一集，避免后台误把整个列表交给 yt-dlp。
+        """
+        bvid = self.normalize_source(source)
+        url = self._build_video_url(bvid, source)
+        output = self._process_runner.run(
+            [
+                self._config.yt_dlp_bin,
+                "--dump-single-json",
+                url,
+            ],
+            timeout_seconds=METADATA_FETCH_TIMEOUT_SECONDS,
+        )
+        payload = json.loads(output)
+        title = str(payload.get("title", bvid))
+        parts = self._parse_video_parts(bvid, payload, url)
+        return bvid, title, parts
+
     def fetch_subtitles(self, metadata: VideoMetadata) -> TranscriptResult | None:
         """Download the most useful Chinese subtitle track if one exists."""
         candidates = [item for item in metadata.subtitle_candidates if item.get("lang", "").startswith("zh")]
@@ -75,6 +106,7 @@ class BiliResolverService:
             [
                 self._config.yt_dlp_bin,
                 "--skip-download",
+                "--no-playlist",
                 "--write-subs",
                 "--write-auto-subs",
                 "--sub-langs",
@@ -84,7 +116,8 @@ class BiliResolverService:
                 "-o",
                 str(target_prefix),
                 metadata.webpage_url,
-            ]
+            ],
+            timeout_seconds=SUBTITLE_FETCH_TIMEOUT_SECONDS,
         )
 
         subtitle_files = sorted(target_dir.glob("*.json3")) + sorted(target_dir.glob("*.vtt"))
@@ -162,3 +195,49 @@ class BiliResolverService:
             if tag:
                 tags.append(tag)
         return tags
+
+    def _parse_video_parts(self, bvid: str, payload: dict[str, object], fallback_url: str) -> list[VideoPart]:
+        """Normalize yt-dlp playlist/page entries into UI-friendly choices."""
+        entries = payload.get("entries")
+        if isinstance(entries, list) and entries:
+            parts: list[VideoPart] = []
+            for index, entry in enumerate(entries, start=1):
+                if not isinstance(entry, dict):
+                    continue
+                entry_title = str(entry.get("title") or entry.get("alt_title") or f"第 {index} 集")
+                entry_duration = int(entry.get("duration") or 0)
+                entry_url = self._normalize_entry_url(bvid, entry, fallback_url, index)
+                parts.append(VideoPart(index=index, title=entry_title, duration=entry_duration, url=entry_url))
+            if parts:
+                return parts
+
+        return [
+            VideoPart(
+                index=1,
+                title=str(payload.get("title", bvid)),
+                duration=int(payload.get("duration") or 0),
+                url=str(payload.get("webpage_url") or fallback_url),
+            )
+        ]
+
+    def _normalize_entry_url(self, bvid: str, entry: dict[str, object], fallback_url: str, index: int) -> str:
+        """Build a concrete URL for one playlist entry."""
+        raw_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+        if raw_url.startswith("http"):
+            return raw_url
+        return self._with_page_index(fallback_url or f"https://www.bilibili.com/video/{bvid}", index)
+
+    def _build_video_url(self, bvid: str, source_input: str) -> str:
+        """Preserve user-selected query parameters when a concrete page URL is provided."""
+        text = source_input.strip()
+        parsed = urlparse(text)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return text
+        return f"https://www.bilibili.com/video/{bvid}"
+
+    def _with_page_index(self, url: str, index: int) -> str:
+        """Attach or replace the Bilibili page index used for multi-part videos."""
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        query["p"] = [str(index)]
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))

@@ -28,6 +28,12 @@ class TaskCreateRequest(BaseModel):
     source: str
 
 
+class VideoOptionsRequest(BaseModel):
+    """Incoming JSON payload for checking selectable video parts."""
+
+    source: str
+
+
 def build_app() -> FastAPI:
     """Create the application and wire all services once at import time."""
     config = AppConfig.load()
@@ -73,6 +79,15 @@ def build_app() -> FastAPI:
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"task_id": task.id, "task": task.to_dict()}
+
+    @app.post("/api/video-options")
+    def inspect_video_options(payload: VideoOptionsRequest) -> dict[str, object]:
+        """Return selectable entries before a task is created."""
+        try:
+            bvid, title, parts = bili_service.inspect_parts(payload.source)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"bvid": bvid, "title": title, "parts": [part.to_dict() for part in parts]}
 
     @app.get("/api/tasks")
     def list_tasks() -> dict[str, object]:
@@ -197,6 +212,42 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       font-size: 14px;
       cursor: pointer;
     }}
+    .part-panel {{
+      display: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 12px;
+      gap: 8px;
+      flex-direction: column;
+    }}
+    .part-panel.visible {{
+      display: flex;
+    }}
+    .part-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 260px;
+      overflow: auto;
+    }}
+    .part-item {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+      text-align: left;
+      cursor: pointer;
+    }}
+    .part-item:hover {{
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }}
+    .part-title {{
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.5;
+    }}
     .tasks {{
       display: flex;
       flex-direction: column;
@@ -278,9 +329,13 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       </div>
       <form id="task-form">
         <input id="source-input" name="source" placeholder="例如：BV1xx411c7mD 或 https://www.bilibili.com/video/BV..." />
-        <button class="submit" type="submit">创建任务</button>
+        <button class="submit" type="submit">解析并创建任务</button>
         <div id="form-message" class="meta-line"></div>
       </form>
+      <div id="part-panel" class="part-panel">
+        <div class="meta-line" id="part-panel-title">选择要处理的视频条目</div>
+        <div id="part-list" class="part-list"></div>
+      </div>
       <div class="sub">最近任务</div>
       <div id="task-list" class="tasks">{task_html}</div>
     </section>
@@ -377,15 +432,8 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
         .replaceAll("'", '&#39;');
     }}
 
-    document.getElementById('task-form').addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const source = document.getElementById('source-input').value.trim();
+    async function createTaskFromSource(source) {{
       const message = document.getElementById('form-message');
-      if (!source) {{
-        message.textContent = '请输入 BV 号或视频链接。';
-        return;
-      }}
-
       message.textContent = '任务已提交，正在创建。';
       const response = await fetch('/api/tasks', {{
         method: 'POST',
@@ -399,8 +447,73 @@ def _render_index_html(tasks: list[dict[str, object]], selected: dict[str, objec
       }}
       selectedTaskId = payload.task_id;
       document.getElementById('source-input').value = '';
+      hidePartPanel();
       message.textContent = `任务 #${{payload.task_id}} 已创建。`;
       await fetchTasks();
+    }}
+
+    function renderPartOptions(title, parts) {{
+      const panel = document.getElementById('part-panel');
+      const panelTitle = document.getElementById('part-panel-title');
+      const list = document.getElementById('part-list');
+      panelTitle.textContent = `${{title}}：请选择要处理的视频条目`;
+      list.innerHTML = parts.map((part) => `
+        <button class="part-item" type="button" data-url="${{escapeHtml(part.url)}}">
+          <div class="part-title">P${{part.index}} ${{escapeHtml(part.title)}}</div>
+          <div class="task-meta">${{formatDuration(part.duration)}} · 点击后创建这个条目的总结任务</div>
+        </button>
+      `).join('');
+      list.querySelectorAll('[data-url]').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          await createTaskFromSource(button.dataset.url);
+        }});
+      }});
+      panel.classList.add('visible');
+    }}
+
+    function hidePartPanel() {{
+      document.getElementById('part-panel').classList.remove('visible');
+      document.getElementById('part-list').innerHTML = '';
+    }}
+
+    function formatDuration(seconds) {{
+      const total = Number(seconds || 0);
+      if (!total) {{
+        return '时长未知';
+      }}
+      const minutes = Math.floor(total / 60);
+      const rest = total % 60;
+      return `${{minutes}}:${{String(rest).padStart(2, '0')}}`;
+    }}
+
+    document.getElementById('task-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const source = document.getElementById('source-input').value.trim();
+      const message = document.getElementById('form-message');
+      if (!source) {{
+        message.textContent = '请输入 BV 号或视频链接。';
+        return;
+      }}
+
+      hidePartPanel();
+      message.textContent = '正在解析视频条目。';
+      const response = await fetch('/api/video-options', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ source }})
+      }});
+      const payload = await response.json();
+      if (!response.ok) {{
+        message.textContent = payload.detail || '解析失败。';
+        return;
+      }}
+      const parts = payload.parts || [];
+      if (parts.length > 1) {{
+        message.textContent = `检测到 ${{parts.length}} 个条目，请选择其中一个。`;
+        renderPartOptions(payload.title || payload.bvid || '视频合集', parts);
+        return;
+      }}
+      await createTaskFromSource(parts[0]?.url || source);
     }});
 
     fetchTasks();

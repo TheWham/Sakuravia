@@ -59,6 +59,25 @@ class BiliResolverMetadataTests(unittest.TestCase):
         self.assertEqual(metadata.webpage_url, "https://www.bilibili.com/video/BV1dRRyBREPM")
         self.assertEqual(metadata.subtitle_candidates[0]["lang"], "zh-CN")
 
+    def test_inspect_parts_returns_selectable_entries(self) -> None:
+        payload = {
+            "title": "英语口语合集",
+            "entries": [
+                {"title": "At the Airport", "duration": 300},
+                {"title": "At the Hotel", "duration": 420},
+            ],
+        }
+        service = BiliResolverService(_config(), FakeProcessRunner(payload))
+
+        bvid, title, parts = service.inspect_parts("BV1X54y1p7Dd")
+
+        self.assertEqual(bvid, "BV1X54y1p7Dd")
+        self.assertEqual(title, "英语口语合集")
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].title, "At the Airport")
+        self.assertIn("p=1", parts[0].url)
+        self.assertIn("p=2", parts[1].url)
+
 
 class FakeProcessRunner:
     """Return a stable yt-dlp JSON payload."""
@@ -66,7 +85,7 @@ class FakeProcessRunner:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
 
-    def run(self, args: list[str], cwd: Path | None = None) -> str:
+    def run(self, args: list[str], cwd: Path | None = None, timeout_seconds: int | None = None) -> str:
         return json.dumps(self.payload, ensure_ascii=False)
 
 
