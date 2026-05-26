@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from html import escape
 
 from fastapi import FastAPI, HTTPException
@@ -18,7 +19,7 @@ from .services.bili import BiliResolverService
 from .services.bili_listener import BiliAuthService, BiliEventService, BiliHttpClient, BiliMentionApi, BiliMentionPoller
 from .services.http_client import SimpleHttpClient
 from .services.mail import MailService
-from .services.process_runner import ProcessRunner
+from .services.process_runner import ProcessExecutionError, ProcessRunner
 from .services.summary import SummaryService
 from .services.task_service import TaskService
 from .services.transcription import TranscriptionService
@@ -68,6 +69,7 @@ def build_app() -> FastAPI:
         summary_service=summary_service,
         artifact_service=artifact_service,
         mail_service=mail_service,
+        keep_audio_after_success=config.keep_audio_after_success,
     )
     task_service.recover_interrupted_tasks()
     bili_http_client = BiliHttpClient(config)
@@ -78,6 +80,7 @@ def build_app() -> FastAPI:
 
     app = FastAPI(title="个人版 B 站 AI 助手", version="1.0.0")
     app.state.task_service = task_service
+    app.state.repository = repository
     app.state.bili_poller = bili_poller
     app.state.bili_event_service = bili_event_service
     app.state.config = config
@@ -98,9 +101,15 @@ def build_app() -> FastAPI:
         tasks = [task.to_dict() for task in task_service.list_tasks()]
         selected = tasks[0] if tasks else None
         listener_state = bili_poller.snapshot().to_dict()
-        bili_events = [event.to_dict() for event in repository.list_bili_events()]
-        bili_users = [user.to_dict() for user in repository.list_bili_user_emails()]
-        return HTMLResponse(_render_index_html(tasks, selected, listener_state, bili_events, bili_users))
+        return HTMLResponse(_render_index_html(tasks, selected, listener_state))
+
+    @app.get("/v2/users", response_class=HTMLResponse)
+    def v2_users() -> HTMLResponse:
+        """Render the V2 B 站用户分析 page."""
+        users = _build_bili_user_payloads(repository)
+        selected_uid = _select_default_bili_uid(users)
+        listener_state = bili_poller.snapshot().to_dict()
+        return HTMLResponse(_render_v2_users_html(listener_state, users, selected_uid))
 
     @app.post("/api/tasks")
     def create_task(payload: TaskCreateRequest) -> dict[str, object]:
@@ -118,6 +127,8 @@ def build_app() -> FastAPI:
             bvid, title, parts = bili_service.inspect_parts(payload.source)
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ProcessExecutionError as exc:
+            raise HTTPException(status_code=502, detail=f"B 站视频解析失败：{exc}") from exc
         return {"bvid": bvid, "title": title, "parts": [part.to_dict() for part in parts]}
 
     @app.get("/api/tasks")
@@ -145,8 +156,8 @@ def build_app() -> FastAPI:
 
     @app.get("/api/bili-users")
     def list_bili_users() -> dict[str, object]:
-        """Return local B 站用户邮箱 bindings."""
-        return {"users": [user.to_dict() for user in repository.list_bili_user_emails()]}
+        """Return local B 站用户邮箱 bindings with lightweight stats."""
+        return {"users": _build_bili_user_payloads(repository)}
 
     @app.post("/api/bili-users")
     def upsert_bili_user(payload: BiliUserEmailRequest) -> dict[str, object]:
@@ -158,13 +169,28 @@ def build_app() -> FastAPI:
         if not email or "@" not in email:
             raise HTTPException(status_code=400, detail="请输入有效邮箱。")
         user = repository.upsert_bili_user_email(uid, payload.username, email)
-        return {"user": user.to_dict()}
+        stats = repository.get_bili_user_stats()
+        return {"user": _build_bili_user_payload(user.to_dict(), stats)}
 
     @app.delete("/api/bili-users/{uid}")
     def delete_bili_user(uid: str) -> dict[str, object]:
         """Delete one local B 站用户邮箱 binding."""
         repository.delete_bili_user_email(uid)
         return {"ok": True}
+
+    @app.get("/api/bili-users/{uid}/events")
+    def list_bili_user_events(uid: str) -> dict[str, object]:
+        """Return recent @ events and task snapshots for one B 站用户 UID."""
+        bili_event_service.sync_task_statuses()
+        events = repository.list_bili_events_by_sender_mid(uid)
+        task_ids = [event.task_id for event in events if event.task_id is not None]
+        task_map = repository.get_task_summary_map(task_ids)
+        payloads: list[dict[str, object]] = []
+        for event in events:
+            item = event.to_dict()
+            item["task"] = task_map.get(event.task_id) if event.task_id is not None else None
+            payloads.append(item)
+        return {"uid": uid.strip(), "events": payloads}
 
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: int) -> dict[str, object]:
@@ -182,8 +208,6 @@ def _render_index_html(
     tasks: list[dict[str, object]],
     selected: dict[str, object] | None,
     listener_state: dict[str, object],
-    bili_events: list[dict[str, object]],
-    bili_users: list[dict[str, object]],
 ) -> str:
     """Render a lightweight HTML page without adding a template dependency."""
     selected_markdown = escape(str((selected or {}).get("markdown_content", "")))
@@ -211,8 +235,6 @@ def _render_index_html(
     listener_status = escape(str(listener_state.get("login_status", "UNKNOWN")))
     listener_running = "运行中" if listener_state.get("running") else "未运行"
     listener_error = escape(str(listener_state.get("last_error", "")))
-    event_html = _render_bili_event_html(bili_events)
-    user_html = _render_bili_user_html(bili_users)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -459,6 +481,18 @@ def _render_index_html(
     .danger {{
       color: var(--danger);
     }}
+    .manage-link {{
+      display: inline-flex;
+      width: fit-content;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--accent);
+      text-decoration: none;
+      background: #fff;
+      font-size: 13px;
+    }}
     @media (max-width: 980px) {{
       .shell {{
         grid-template-columns: 1fr;
@@ -488,18 +522,7 @@ def _render_index_html(
         <div class="meta-line">账号：<span id="bili-account">暂无</span></div>
         <div class="meta-line">最近轮询：<span id="bili-last-poll">暂无</span></div>
         <div id="bili-error" class="danger">{listener_error or "无"}</div>
-        <div id="bili-event-list" class="event-list">{event_html}</div>
-      </div>
-      <div class="listener">
-        <div class="sub">用户邮箱簿</div>
-        <form id="bili-user-form">
-          <input id="bili-user-uid" name="uid" placeholder="B 站用户 UID，例如 123456" />
-          <input id="bili-user-name" name="username" placeholder="用户名，例如 测试用户" />
-          <input id="bili-user-email" name="email" placeholder="邮箱，例如 user@example.com" />
-          <button class="submit" type="submit">保存绑定</button>
-          <div id="bili-user-message" class="meta-line"></div>
-        </form>
-        <div id="bili-user-list" class="user-list">{user_html}</div>
+        <a class="manage-link" href="/v2/users">查看用户状态</a>
       </div>
       <div class="sub">最近任务</div>
       <div id="task-list" class="tasks">{task_html}</div>
@@ -558,15 +581,6 @@ def _render_index_html(
       renderBiliListener(payload.state || {{}}, payload.events || []);
     }}
 
-    async function fetchBiliUsers() {{
-      const response = await fetch('/api/bili-users');
-      if (!response.ok) {{
-        return;
-      }}
-      const payload = await response.json();
-      renderBiliUsers(payload.users || []);
-    }}
-
     function renderTaskList(tasks) {{
       const container = document.getElementById('task-list');
       if (!tasks.length) {{
@@ -592,7 +606,7 @@ def _render_index_html(
       }});
     }}
 
-    function renderBiliListener(state, events) {{
+    function renderBiliListener(state) {{
       document.getElementById('bili-login-status').textContent = state.login_status || 'UNKNOWN';
       document.getElementById('bili-running-status').textContent = state.running ? '运行中' : '未运行';
       document.getElementById('bili-account').textContent = state.account_name
@@ -600,56 +614,6 @@ def _render_index_html(
         : '暂无';
       document.getElementById('bili-last-poll').textContent = state.last_poll_at || '暂无';
       document.getElementById('bili-error').textContent = state.last_error || '无';
-
-      const container = document.getElementById('bili-event-list');
-      if (!events.length) {{
-        container.innerHTML = '<div class="empty">暂无 B 站 @ 事件。</div>';
-        return;
-      }}
-      container.innerHTML = events.slice(0, 10).map((event) => {{
-        const taskId = event.task_id || '';
-        const active = taskId && Number(taskId) === selectedTaskId ? 'active' : '';
-        return `
-          <button class="event-item ${{active}}" type="button" data-task-id="${{taskId}}">
-            <div class="task-title">${{escapeHtml(event.sender_name || event.sender_mid || '未知用户')}}</div>
-            <div class="task-meta">${{escapeHtml(event.status || '')}} / ${{escapeHtml(event.delivery_status || '')}} #${{escapeHtml(event.bvid || '')}}</div>
-            <div class="task-meta">UID ${{escapeHtml(event.sender_mid || '')}} · ${{escapeHtml(event.recipient_email || '未绑定邮箱')}}</div>
-            <div class="task-meta">${{escapeHtml(event.content || '')}}</div>
-          </button>
-        `;
-      }}).join('');
-      container.querySelectorAll('[data-task-id]').forEach((button) => {{
-        button.addEventListener('click', async () => {{
-          if (!button.dataset.taskId) {{
-            return;
-          }}
-          selectedTaskId = Number(button.dataset.taskId);
-          await fetchTaskDetail(selectedTaskId);
-        }});
-      }});
-    }}
-
-    function renderBiliUsers(users) {{
-      const container = document.getElementById('bili-user-list');
-      if (!users.length) {{
-        container.innerHTML = '<div class="empty">暂无用户邮箱绑定。</div>';
-        return;
-      }}
-      container.innerHTML = users.map((user) => `
-        <div class="user-item">
-          <div>
-            <div class="task-title">${{escapeHtml(user.username || '未命名用户')}}</div>
-            <div class="task-meta">UID ${{escapeHtml(user.uid)}} · ${{escapeHtml(user.email)}}</div>
-          </div>
-          <button class="delete-user" type="button" data-uid="${{escapeHtml(user.uid)}}">删除</button>
-        </div>
-      `).join('');
-      container.querySelectorAll('[data-uid]').forEach((button) => {{
-        button.addEventListener('click', async () => {{
-          await fetch(`/api/bili-users/${{encodeURIComponent(button.dataset.uid)}}`, {{ method: 'DELETE' }});
-          await fetchBiliUsers();
-        }});
-      }});
     }}
 
     async function fetchTaskDetail(taskId) {{
@@ -761,33 +725,6 @@ def _render_index_html(
       await createTaskFromSource(parts[0]?.url || source);
     }});
 
-    document.getElementById('bili-user-form').addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const message = document.getElementById('bili-user-message');
-      const uid = document.getElementById('bili-user-uid').value.trim();
-      const username = document.getElementById('bili-user-name').value.trim();
-      const email = document.getElementById('bili-user-email').value.trim();
-      if (!uid || !email) {{
-        message.textContent = '请输入 UID 和邮箱。';
-        return;
-      }}
-      const response = await fetch('/api/bili-users', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ uid, username, email }})
-      }});
-      const payload = await response.json();
-      if (!response.ok) {{
-        message.textContent = payload.detail || '保存失败。';
-        return;
-      }}
-      document.getElementById('bili-user-uid').value = '';
-      document.getElementById('bili-user-name').value = '';
-      document.getElementById('bili-user-email').value = '';
-      message.textContent = '绑定已保存。';
-      await fetchBiliUsers();
-    }});
-
     document.getElementById('retry-task-button').addEventListener('click', async () => {{
       if (!selectedTaskId) {{
         return;
@@ -801,11 +738,9 @@ def _render_index_html(
 
     fetchTasks();
     fetchBiliListener();
-    fetchBiliUsers();
     setInterval(async () => {{
       await fetchTasks();
       await fetchBiliListener();
-      await fetchBiliUsers();
     }}, 4000);
   </script>
 </body>
@@ -866,6 +801,616 @@ def _render_bili_user_html(users: list[dict[str, object]]) -> str:
             )
         )
     return "\n".join(items)
+
+
+def _empty_bili_user_stats() -> dict[str, object]:
+    """Return the default V2 stats shape for users without @ events."""
+    return {
+        "event_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "last_event_at": "",
+        "last_error": "",
+    }
+
+
+def _build_bili_user_payload(user: dict[str, object], stats_by_uid: dict[str, dict[str, object]]) -> dict[str, object]:
+    """Merge one UID binding with its local event statistics."""
+    payload = dict(user)
+    payload["stats"] = stats_by_uid.get(str(user.get("uid") or ""), _empty_bili_user_stats())
+    return payload
+
+
+def _build_bili_user_payloads(repository: TaskRepository) -> list[dict[str, object]]:
+    """Build the `/api/bili-users` response without changing the old user fields."""
+    stats_by_uid = repository.get_bili_user_stats()
+    return [
+        _build_bili_user_payload(user.to_dict(), stats_by_uid)
+        for user in repository.list_bili_user_emails()
+    ]
+
+
+def _select_default_bili_uid(users: list[dict[str, object]]) -> str:
+    """Prefer the user with recent activity, then fall back to the first binding."""
+    if not users:
+        return ""
+    users_with_events = [
+        user
+        for user in users
+        if str((user.get("stats") or {}).get("last_event_at") or "")
+    ]
+    if users_with_events:
+        selected = max(
+            users_with_events,
+            key=lambda user: str((user.get("stats") or {}).get("last_event_at") or ""),
+        )
+        return str(selected.get("uid") or "")
+    return str(users[0].get("uid") or "")
+
+
+def _render_v2_user_list_html(users: list[dict[str, object]], selected_uid: str) -> str:
+    """Render the first V2 user list before browser polling takes over."""
+    if not users:
+        return '<div class="empty">暂无用户邮箱绑定。</div>'
+
+    items = []
+    for user in users:
+        stats = user.get("stats") or {}
+        uid = escape(str(user.get("uid") or ""))
+        username = escape(str(user.get("username") or "未命名用户"))
+        email = escape(str(user.get("email") or ""))
+        event_count = escape(str(stats.get("event_count") or 0))
+        failed_count = escape(str(stats.get("failed_count") or 0))
+        active = " active" if uid == selected_uid else ""
+        items.append(
+            "\n".join(
+                [
+                    f'<button class="user-row{active}" type="button" data-uid="{uid}">',
+                    "  <span>",
+                    f'    <span class="row-title">{username}</span>',
+                    f'    <span class="row-meta">UID {uid} · {email}</span>',
+                    "  </span>",
+                    f'  <span class="row-badge">{event_count} 次 / 失败 {failed_count}</span>',
+                    "</button>",
+                ]
+            )
+        )
+    return "\n".join(items)
+
+
+def _render_v2_users_html(
+    listener_state: dict[str, object],
+    users: list[dict[str, object]],
+    selected_uid: str,
+) -> str:
+    """Render the V2 用户分析 page with plain HTML, CSS, and JS."""
+    listener_status = escape(str(listener_state.get("login_status", "UNKNOWN")))
+    listener_running = "运行中" if listener_state.get("running") else "未运行"
+    listener_error = escape(str(listener_state.get("last_error") or "无"))
+    user_list_html = _render_v2_user_list_html(users, selected_uid)
+    selected_uid_json = json.dumps(selected_uid, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V2 用户状态 - B 站 AI 助手</title>
+  <style>
+    :root {{
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #d9e1ea;
+      --text: #18222d;
+      --muted: #5c6875;
+      --accent: #0077d9;
+      --accent-soft: #eaf4ff;
+      --success: #168251;
+      --danger: #c7344f;
+      --warn: #a66a00;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f4f6f8;
+      color: var(--text);
+    }}
+    .topbar {{
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }}
+    .topbar-inner {{
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .brand {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.3;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }}
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+    }}
+    .shell {{
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 20px 24px 28px;
+      display: grid;
+      grid-template-columns: 390px 1fr;
+      gap: 18px;
+      min-height: calc(100vh - 72px);
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .left,
+    .right {{
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }}
+    .section-title {{
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }}
+    .listener {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+      display: grid;
+      gap: 6px;
+    }}
+    form {{
+      display: grid;
+      gap: 10px;
+    }}
+    input {{
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 14px;
+      background: #fff;
+    }}
+    button {{
+      font-family: inherit;
+    }}
+    .primary {{
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+    }}
+    .danger-button {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 12px;
+      background: #fff;
+      color: var(--danger);
+      cursor: pointer;
+    }}
+    .user-list,
+    .event-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow: auto;
+    }}
+    .user-list {{
+      max-height: 48vh;
+    }}
+    .event-list {{
+      max-height: 52vh;
+    }}
+    .user-row {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px;
+      background: #fff;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      text-align: left;
+      cursor: pointer;
+      align-items: center;
+    }}
+    .user-row.active {{
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }}
+    .row-title {{
+      display: block;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.4;
+    }}
+    .row-meta {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      word-break: break-all;
+    }}
+    .row-badge,
+    .tag {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .tag.ok {{
+      color: var(--success);
+      border-color: #bde5d2;
+      background: #f0fbf5;
+    }}
+    .tag.fail {{
+      color: var(--danger);
+      border-color: #f0bfcb;
+      background: #fff4f6;
+    }}
+    .detail-head {{
+      display: grid;
+      gap: 12px;
+    }}
+    .detail-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .stats-grid {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+    }}
+    .stat {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfe;
+      min-width: 0;
+    }}
+    .stat-value {{
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.4;
+      word-break: break-word;
+    }}
+    .event-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      display: grid;
+      gap: 8px;
+    }}
+    .event-top {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .content {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      font-size: 13px;
+    }}
+    .task-strip {{
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+      display: grid;
+      gap: 4px;
+    }}
+    .empty {{
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      color: var(--muted);
+      font-size: 14px;
+      background: #fbfcfe;
+    }}
+    .danger {{
+      color: var(--danger);
+    }}
+    @media (max-width: 1020px) {{
+      .shell {{
+        grid-template-columns: 1fr;
+      }}
+      .stats-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <h1>V2 用户状态</h1>
+        <div class="meta">用户邮箱簿、@ 请求记录、任务和邮件状态</div>
+      </div>
+      <a href="/">返回首页</a>
+    </div>
+  </header>
+  <main class="shell">
+    <section class="panel left">
+      <div class="listener">
+        <div class="section-title">B 站监听</div>
+        <div class="meta">状态：<span id="v2-login-status">{listener_status}</span> / <span id="v2-running-status">{listener_running}</span></div>
+        <div class="meta">账号：<span id="v2-account">暂无</span></div>
+        <div class="meta">最近轮询：<span id="v2-last-poll">暂无</span></div>
+        <div id="v2-error" class="danger">{listener_error}</div>
+      </div>
+      <div>
+        <div class="section-title">新增/更新绑定</div>
+        <form id="v2-user-form" style="margin-top:10px;">
+          <input id="v2-user-uid" name="uid" placeholder="B 站用户 UID，例如 123456" />
+          <input id="v2-user-name" name="username" placeholder="用户名，例如 测试用户" />
+          <input id="v2-user-email" name="email" placeholder="邮箱，例如 user@example.com" />
+          <button class="primary" type="submit">保存绑定</button>
+          <div id="v2-form-message" class="meta"></div>
+        </form>
+      </div>
+      <div>
+        <div class="section-title">用户邮箱簿</div>
+        <div id="v2-user-list" class="user-list" style="margin-top:10px;">{user_list_html}</div>
+      </div>
+    </section>
+    <section class="panel right">
+      <div id="v2-user-detail" class="detail-head">
+        <div class="empty">正在加载用户状态。</div>
+      </div>
+      <div>
+        <div class="section-title">最近 @ 事件</div>
+        <div id="v2-event-list" class="event-list" style="margin-top:10px;">
+          <div class="empty">请选择一个用户。</div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    let selectedUid = {selected_uid_json};
+    let currentUsers = [];
+
+    async function fetchListener() {{
+      const response = await fetch('/api/bili-listener');
+      if (!response.ok) {{
+        return;
+      }}
+      const payload = await response.json();
+      renderListener(payload.state || {{}});
+    }}
+
+    async function fetchUsers(preferredUid = null) {{
+      const response = await fetch('/api/bili-users');
+      if (!response.ok) {{
+        return;
+      }}
+      const payload = await response.json();
+      currentUsers = payload.users || [];
+      if (preferredUid) {{
+        selectedUid = preferredUid;
+      }}
+      if (!selectedUid || !currentUsers.some((user) => user.uid === selectedUid)) {{
+        selectedUid = pickDefaultUid(currentUsers);
+      }}
+      renderUsers();
+      if (selectedUid) {{
+        await fetchUserEvents(selectedUid);
+      }} else {{
+        renderEmptyDetail();
+      }}
+    }}
+
+    async function fetchUserEvents(uid) {{
+      const response = await fetch(`/api/bili-users/${{encodeURIComponent(uid)}}/events`);
+      if (!response.ok) {{
+        return;
+      }}
+      const payload = await response.json();
+      const user = currentUsers.find((item) => item.uid === uid);
+      renderUserDetail(user, payload.events || []);
+      renderEvents(payload.events || []);
+    }}
+
+    function pickDefaultUid(users) {{
+      if (!users.length) {{
+        return '';
+      }}
+      const withEvents = users
+        .filter((user) => user.stats && user.stats.last_event_at)
+        .sort((left, right) => String(right.stats.last_event_at).localeCompare(String(left.stats.last_event_at)));
+      return (withEvents[0] || users[0]).uid || '';
+    }}
+
+    function renderListener(state) {{
+      document.getElementById('v2-login-status').textContent = state.login_status || 'UNKNOWN';
+      document.getElementById('v2-running-status').textContent = state.running ? '运行中' : '未运行';
+      document.getElementById('v2-account').textContent = state.account_name
+        ? `${{state.account_name}} (${{state.account_mid || 'unknown'}})`
+        : '暂无';
+      document.getElementById('v2-last-poll').textContent = state.last_poll_at || '暂无';
+      document.getElementById('v2-error').textContent = state.last_error || '无';
+    }}
+
+    function renderUsers() {{
+      const container = document.getElementById('v2-user-list');
+      if (!currentUsers.length) {{
+        container.innerHTML = '<div class="empty">暂无用户邮箱绑定。</div>';
+        return;
+      }}
+      container.innerHTML = currentUsers.map((user) => {{
+        const stats = user.stats || {{}};
+        const active = user.uid === selectedUid ? ' active' : '';
+        return `
+          <button class="user-row${{active}}" type="button" data-uid="${{escapeHtml(user.uid)}}">
+            <span>
+              <span class="row-title">${{escapeHtml(user.username || '未命名用户')}}</span>
+              <span class="row-meta">UID ${{escapeHtml(user.uid)}} · ${{escapeHtml(user.email)}}</span>
+            </span>
+            <span class="row-badge">${{Number(stats.event_count || 0)}} 次 / 失败 ${{Number(stats.failed_count || 0)}}</span>
+          </button>
+        `;
+      }}).join('');
+      container.querySelectorAll('[data-uid]').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          selectedUid = button.dataset.uid || '';
+          renderUsers();
+          await fetchUserEvents(selectedUid);
+        }});
+      }});
+    }}
+
+    function renderUserDetail(user, events) {{
+      const container = document.getElementById('v2-user-detail');
+      if (!user) {{
+        renderEmptyDetail();
+        return;
+      }}
+      const stats = user.stats || {{}};
+      const lastError = stats.last_error || '无';
+      container.innerHTML = `
+        <div class="detail-actions">
+          <div>
+            <h1>${{escapeHtml(user.username || '未命名用户')}}</h1>
+            <div class="meta">UID ${{escapeHtml(user.uid)}} · ${{escapeHtml(user.email)}}</div>
+          </div>
+          <button class="danger-button" type="button" id="delete-selected-user">删除绑定</button>
+        </div>
+        <div class="stats-grid">
+          <div class="stat"><div class="meta">绑定邮箱</div><div class="stat-value">${{user.email ? '已绑定' : '未绑定'}}</div></div>
+          <div class="stat"><div class="meta">事件数</div><div class="stat-value">${{Number(stats.event_count || 0)}}</div></div>
+          <div class="stat"><div class="meta">成功数</div><div class="stat-value">${{Number(stats.success_count || 0)}}</div></div>
+          <div class="stat"><div class="meta">失败数</div><div class="stat-value">${{Number(stats.failed_count || 0)}}</div></div>
+          <div class="stat"><div class="meta">最近请求</div><div class="stat-value">${{escapeHtml(stats.last_event_at || '暂无')}}</div></div>
+        </div>
+        <div class="listener">
+          <div class="meta">最近错误</div>
+          <div class="${{lastError === '无' ? '' : 'danger'}}">${{escapeHtml(lastError)}}</div>
+        </div>
+      `;
+      document.getElementById('delete-selected-user').addEventListener('click', async () => {{
+        await fetch(`/api/bili-users/${{encodeURIComponent(user.uid)}}`, {{ method: 'DELETE' }});
+        selectedUid = '';
+        await fetchUsers();
+      }});
+    }}
+
+    function renderEvents(events) {{
+      const container = document.getElementById('v2-event-list');
+      if (!events.length) {{
+        container.innerHTML = '<div class="empty">该用户暂无 @ 请求记录。</div>';
+        return;
+      }}
+      container.innerHTML = events.map((event) => {{
+        const task = event.task || null;
+        const statusClass = event.delivery_status === 'SENT'
+          ? 'ok'
+          : (event.delivery_status === 'FAILED' || event.status === 'FAILED' || event.status === 'TASK_FAILED' ? 'fail' : '');
+        const taskHtml = task ? `
+          <div class="task-strip">
+            <div class="meta">关联任务 #${{task.id}} · ${{escapeHtml(task.status || '')}} / ${{escapeHtml(task.mail_status || '')}}</div>
+            <div class="content">${{escapeHtml(task.video_title || task.bvid || '未命名任务')}}</div>
+            ${{task.error_message ? `<div class="danger">${{escapeHtml(task.error_message)}}</div>` : ''}}
+          </div>
+        ` : '<div class="task-strip"><div class="meta">暂无关联任务</div></div>';
+        return `
+          <div class="event-card">
+            <div class="event-top">
+              <div class="row-title">${{escapeHtml(event.bvid || '未解析 BV')}}</div>
+              <span class="tag ${{statusClass}}">${{escapeHtml(event.status || '')}} / ${{escapeHtml(event.delivery_status || '')}}</span>
+            </div>
+            <div class="meta">${{escapeHtml(event.created_at || '')}} · 收件：${{escapeHtml(event.recipient_email || '未绑定邮箱')}}</div>
+            <div class="content">${{escapeHtml(event.content || '')}}</div>
+            ${{event.error_message ? `<div class="danger">${{escapeHtml(event.error_message)}}</div>` : ''}}
+            ${{taskHtml}}
+          </div>
+        `;
+      }}).join('');
+    }}
+
+    function renderEmptyDetail() {{
+      document.getElementById('v2-user-detail').innerHTML = '<div class="empty">暂无用户。请先添加 UID 与邮箱绑定。</div>';
+      document.getElementById('v2-event-list').innerHTML = '<div class="empty">暂无可展示的 @ 请求记录。</div>';
+    }}
+
+    function escapeHtml(value) {{
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
+    document.getElementById('v2-user-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const message = document.getElementById('v2-form-message');
+      const uid = document.getElementById('v2-user-uid').value.trim();
+      const username = document.getElementById('v2-user-name').value.trim();
+      const email = document.getElementById('v2-user-email').value.trim();
+      if (!uid || !email) {{
+        message.textContent = '请输入 UID 和邮箱。';
+        return;
+      }}
+      const response = await fetch('/api/bili-users', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ uid, username, email }})
+      }});
+      const payload = await response.json();
+      if (!response.ok) {{
+        message.textContent = payload.detail || '保存失败。';
+        return;
+      }}
+      document.getElementById('v2-user-uid').value = '';
+      document.getElementById('v2-user-name').value = '';
+      document.getElementById('v2-user-email').value = '';
+      message.textContent = '绑定已保存。';
+      await fetchUsers(payload.user.uid);
+    }});
+
+    fetchListener();
+    fetchUsers(selectedUid);
+    setInterval(async () => {{
+      await fetchListener();
+      await fetchUsers(selectedUid);
+    }}, 4000);
+  </script>
+</body>
+</html>"""
 
 
 app = build_app()

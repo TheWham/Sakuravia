@@ -7,11 +7,15 @@ import mimetypes
 import uuid
 from pathlib import Path
 from urllib import request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 class HttpRequestError(RuntimeError):
     """Raised when a remote API returns an error response."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class SimpleHttpClient:
@@ -26,6 +30,14 @@ class SimpleHttpClient:
         req.add_header("Content-Type", "application/json")
         self._add_default_headers(req)
         for key, value in headers.items():
+            req.add_header(key, value)
+        return self._read_json(req)
+
+    def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, object]:
+        """Download a JSON document from a provider-owned result URL."""
+        req = request.Request(url, method="GET")
+        self._add_default_headers(req)
+        for key, value in (headers or {}).items():
             req.add_header(key, value)
         return self._read_json(req)
 
@@ -67,7 +79,9 @@ class SimpleHttpClient:
                 return response.read().decode("utf-8")
         except HTTPError as exc:
             message = exc.read().decode("utf-8", errors="ignore")
-            raise HttpRequestError(message or str(exc)) from exc
+            raise HttpRequestError(message or str(exc), status_code=exc.code) from exc
+        except URLError as exc:
+            raise HttpRequestError(f"网络请求失败：{exc.reason}") from exc
 
     def _add_default_headers(self, req: request.Request) -> None:
         """Use a normal client fingerprint so API gateways do not reject urllib's default UA."""
@@ -81,4 +95,6 @@ class SimpleHttpClient:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             message = exc.read().decode("utf-8", errors="ignore")
-            raise HttpRequestError(message or str(exc)) from exc
+            raise HttpRequestError(message or str(exc), status_code=exc.code) from exc
+        except URLError as exc:
+            raise HttpRequestError(f"网络请求失败：{exc.reason}") from exc

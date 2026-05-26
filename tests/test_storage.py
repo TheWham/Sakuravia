@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.models import MailStatus, SummaryResult, TaskStatus, TranscriptResult, VideoMetadata
+from app.models import BiliDeliveryStatus, BiliEventStatus, MailStatus, SummaryResult, TaskStatus, TranscriptResult, VideoMetadata
 from app.storage import TaskRepository
 from app.services.task_service import TaskService
 
@@ -65,9 +65,53 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual([task.id for task in retryable], [active.id])
         self.assertEqual(active_after.status, TaskStatus.PENDING)
         self.assertEqual(active_after.mail_status, MailStatus.PENDING)
-        self.assertEqual(active_after.retry_count, 1)
+        self.assertEqual(active_after.auto_retry_count, 1)
+        self.assertEqual(active_after.manual_retry_count, 0)
+        self.assertEqual(active_after.retry_count, 0)
         self.assertEqual(active_after.last_checkpoint, "startup_retry")
         self.assertEqual(done_after.status, TaskStatus.SUCCESS)
+
+    def test_interrupted_tasks_fail_after_auto_retry_limit(self) -> None:
+        active = self.repo.create_task("BV1active", "BV1active")
+        self.repo.update_task_fields(
+            active.id,
+            status=TaskStatus.DOWNLOADING_AUDIO.value,
+            mail_status=MailStatus.PENDING.value,
+            auto_retry_count=2,
+        )
+
+        retryable = self.repo.prepare_interrupted_tasks_for_retry()
+        active_after = self.repo.get_task(active.id)
+
+        self.assertEqual(retryable, [])
+        self.assertEqual(active_after.status, TaskStatus.FAILED)
+        self.assertEqual(active_after.mail_status, MailStatus.FAILED)
+        self.assertEqual(active_after.auto_retry_count, 2)
+        self.assertEqual(active_after.manual_retry_count, 0)
+        self.assertEqual(active_after.last_checkpoint, "retry_exhausted")
+        self.assertIn("自动重试次数已用完", active_after.error_message)
+
+    def test_reset_task_for_retry_only_increments_manual_count(self) -> None:
+        task = self.repo.create_task("BV1manual", "BV1manual")
+        self.repo.update_task_fields(
+            task.id,
+            status=TaskStatus.FAILED.value,
+            mail_status=MailStatus.FAILED.value,
+            retry_count=5,
+            auto_retry_count=1,
+            manual_retry_count=3,
+            error_message="上次处理失败",
+        )
+
+        retried = self.repo.reset_task_for_retry(task.id)
+
+        self.assertEqual(retried.status, TaskStatus.PENDING)
+        self.assertEqual(retried.mail_status, MailStatus.PENDING)
+        self.assertEqual(retried.auto_retry_count, 1)
+        self.assertEqual(retried.manual_retry_count, 4)
+        self.assertEqual(retried.retry_count, 5)
+        self.assertEqual(retried.last_checkpoint, "manual_retry")
+        self.assertEqual(retried.error_message, "")
 
     def test_failed_bili_events_reopen_when_task_is_retried(self) -> None:
         task = self.repo.create_task("BV1event", "BV1event")
@@ -123,6 +167,63 @@ class RepositoryTests(unittest.TestCase):
 
         self.repo.delete_bili_user_email("100")
         self.assertIsNone(self.repo.find_bili_user_email_by_uid("100"))
+
+    def test_bili_events_can_be_listed_by_sender_mid(self) -> None:
+        first = self.repo.create_bili_event_if_absent("n1", "c1", "100", "测试用户", "@ai BV1first")
+        second = self.repo.create_bili_event_if_absent("n2", "c2", "200", "其他用户", "@ai BV1other")
+        third = self.repo.create_bili_event_if_absent("n3", "c3", "100", "测试用户", "@ai BV1third")
+
+        events = self.repo.list_bili_events_by_sender_mid("100")
+
+        self.assertEqual([event.id for event in events], [third.id, first.id])
+        self.assertNotIn(second.id, [event.id for event in events])
+
+    def test_bili_user_stats_count_events_and_failures(self) -> None:
+        self.repo.upsert_bili_user_email("100", "测试用户", "target@example.com")
+        self.repo.upsert_bili_user_email("300", "无事件用户", "empty@example.com")
+        success_event = self.repo.create_bili_event_if_absent("n1", "c1", "100", "测试用户", "@ai BV1success")
+        failed_event = self.repo.create_bili_event_if_absent("n2", "c2", "100", "测试用户", "@ai BV1failed")
+        self.repo.update_bili_event_fields(
+            success_event.id,
+            status=BiliEventStatus.TASK_SUCCESS.value,
+            delivery_status=BiliDeliveryStatus.SENT.value,
+        )
+        self.repo.update_bili_event_fields(
+            failed_event.id,
+            status=BiliEventStatus.FAILED.value,
+            delivery_status=BiliDeliveryStatus.FAILED.value,
+            error_message="未绑定邮箱",
+        )
+
+        stats = self.repo.get_bili_user_stats()
+
+        self.assertEqual(stats["100"]["event_count"], 2)
+        self.assertEqual(stats["100"]["success_count"], 1)
+        self.assertEqual(stats["100"]["failed_count"], 1)
+        self.assertNotEqual(stats["100"]["last_event_at"], "")
+        self.assertEqual(stats["100"]["last_error"], "未绑定邮箱")
+        self.assertEqual(stats["300"]["event_count"], 0)
+        self.assertEqual(stats["300"]["success_count"], 0)
+        self.assertEqual(stats["300"]["failed_count"], 0)
+        self.assertEqual(stats["300"]["last_error"], "")
+
+    def test_task_summary_map_returns_lightweight_task_fields(self) -> None:
+        task = self.repo.create_task("BV1summary", "BV1summary")
+        self.repo.update_task_fields(
+            task.id,
+            status=TaskStatus.FAILED.value,
+            mail_status=MailStatus.FAILED.value,
+            video_title="失败视频",
+            error_message="处理失败",
+        )
+
+        summary = self.repo.get_task_summary_map([task.id, 999])
+
+        self.assertEqual(summary[task.id]["video_title"], "失败视频")
+        self.assertEqual(summary[task.id]["status"], TaskStatus.FAILED.value)
+        self.assertEqual(summary[task.id]["mail_status"], MailStatus.FAILED.value)
+        self.assertEqual(summary[task.id]["error_message"], "处理失败")
+        self.assertNotIn(999, summary)
 
 
 class TaskServiceTests(unittest.TestCase):
@@ -213,12 +314,54 @@ class TaskServiceTests(unittest.TestCase):
         self.assertEqual(mail_service.send_count, 1)
         self.assertEqual(bili_service.fetch_metadata_count, 0)
 
+    def test_successful_asr_task_deletes_local_audio_by_default(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "asr_audio")
+        self.assertEqual(final_task.audio_file_path, "")
+        self.assertFalse(audio_service.last_audio_path.exists())
+
+    def test_failed_asr_task_keeps_local_audio_for_retry(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FailingTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.FAILED)
+        self.assertTrue(audio_service.last_audio_path.exists())
+        self.assertEqual(final_task.audio_file_path, str(audio_service.last_audio_path))
+
 
 class FakeBiliService:
     """Simple stub that keeps the task flow deterministic in tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, has_subtitle: bool = True) -> None:
         self.fetch_metadata_count = 0
+        self.has_subtitle = has_subtitle
 
     def normalize_source(self, source: str) -> str:
         return source
@@ -237,6 +380,8 @@ class FakeBiliService:
         return self.fetch_metadata(bvid)
 
     def fetch_subtitles(self, metadata: VideoMetadata) -> TranscriptResult:
+        if not self.has_subtitle:
+            return None
         return TranscriptResult(source="official_subtitle", full_text="第一段\n第二段")
 
 
@@ -245,11 +390,11 @@ class FakeAudioService:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.last_audio_path = self.root / "sample.m4a"
 
     def download_audio(self, metadata: VideoMetadata) -> Path:
-        file_path = self.root / "sample.m4a"
-        file_path.write_bytes(b"test")
-        return file_path
+        self.last_audio_path.write_bytes(b"test")
+        return self.last_audio_path
 
     def split_audio(self, audio_path: Path, chunk_seconds: int = 600) -> list[Path]:
         return [audio_path]
@@ -260,6 +405,13 @@ class FakeTranscriptionService:
 
     def transcribe_audio(self, audio_path: Path) -> TranscriptResult:
         return TranscriptResult(source="asr_audio", full_text="转写内容")
+
+
+class FailingTranscriptionService:
+    """Raise after audio download so retry artifacts can be asserted."""
+
+    def transcribe_audio(self, audio_path: Path) -> TranscriptResult:
+        raise RuntimeError("ASR 失败")
 
 
 class FakeSummaryService:

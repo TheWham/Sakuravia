@@ -136,6 +136,8 @@ class TaskRecord:
     mail_status: MailStatus
     send_mail: bool
     retry_count: int
+    auto_retry_count: int
+    manual_retry_count: int
     last_checkpoint: str
     error_message: str
     created_at: str
