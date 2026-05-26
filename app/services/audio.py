@@ -28,8 +28,6 @@ class SubtitleOrAudioService:
         run_dir = video_dir / f"run_{datetime.utcnow():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}"
         run_dir.mkdir(parents=True, exist_ok=True)
         output_template = run_dir / f"{metadata.bvid}.%(ext)s"
-        ffmpeg_dir = Path(self._config.ffmpeg_bin).parent
-
         # Windows 上偶尔会有上次失败遗留且仍被锁住的 .part 文件。
         # 清理只是减少目录噪音，失败不能阻断本次下载，所以真正下载写入新的 run 目录。
         for stale_file in video_dir.glob(f"{metadata.bvid}.*.part"):
@@ -44,8 +42,7 @@ class SubtitleOrAudioService:
                 "--no-playlist",
                 "--audio-format",
                 "m4a",
-                "--ffmpeg-location",
-                str(ffmpeg_dir),
+                *self._build_ffmpeg_location_args(),
                 "--no-part",
                 "--force-overwrites",
                 "-o",
@@ -99,3 +96,16 @@ class SubtitleOrAudioService:
             command.extend(["--cookies", str(self._config.yt_dlp_cookies_file)])
         command.extend(args)
         return command
+
+    def _build_ffmpeg_location_args(self) -> list[str]:
+        """Return yt-dlp's ffmpeg location only when we have a concrete path.
+
+        `FFMPEG_BIN=ffmpeg` means "use PATH". Passing its parent directory to
+        yt-dlp would become `--ffmpeg-location .`, which breaks Ubuntu servers.
+        Absolute paths such as `/usr/bin/ffmpeg` or Windows install paths still
+        provide the directory so yt-dlp can find both ffmpeg and ffprobe.
+        """
+        ffmpeg_path = Path(self._config.ffmpeg_bin)
+        if ffmpeg_path.parent == Path("."):
+            return []
+        return ["--ffmpeg-location", str(ffmpeg_path.parent)]
