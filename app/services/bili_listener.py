@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -43,6 +44,7 @@ class BiliMentionItem:
     sender_name: str
     content: str
     mentions_self: bool
+    timestamp_seconds: int = 0
 
 
 @dataclass(slots=True)
@@ -59,6 +61,8 @@ class BiliListenerState:
     last_interval_seconds: int
     poll_count: int
     consecutive_failures: int
+    startup_cutoff_seconds: int
+    skipped_old_count: int
     paused_reason: str
     last_error: str
 
@@ -157,6 +161,7 @@ class BiliMentionApi:
         mentions_self = self._mentions_self(nested_item.get("at_details"))
         if not notification_id:
             notification_id = f"{comment_id}:{sender_mid}:{hash(content)}"
+        timestamp_seconds = self._parse_timestamp_seconds(item, nested_item)
         return BiliMentionItem(
             notification_id=notification_id,
             comment_id=comment_id,
@@ -164,7 +169,30 @@ class BiliMentionApi:
             sender_name=sender_name,
             content=content,
             mentions_self=mentions_self,
+            timestamp_seconds=timestamp_seconds,
         )
+
+    def _parse_timestamp_seconds(self, item: dict[str, Any], nested_item: dict[str, Any]) -> int:
+        """Read the notification timestamp from the loose B 站 @ feed shape."""
+        for source in (item, nested_item):
+            for key in ("at_time", "ctime", "timestamp", "time", "notify_time", "created_at"):
+                value = source.get(key)
+                timestamp = self._normalize_timestamp(value)
+                if timestamp > 0:
+                    return timestamp
+        return 0
+
+    def _normalize_timestamp(self, value: object) -> int:
+        """Convert common second/millisecond timestamp values to Unix seconds."""
+        if value is None:
+            return 0
+        try:
+            timestamp = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return 0
+        if timestamp > 10_000_000_000:
+            timestamp //= 1000
+        return timestamp
 
     def _mentions_self(self, at_details: object) -> bool:
         """Check at_details when Bilibili includes it; otherwise trust the @ feed."""
@@ -351,6 +379,8 @@ class BiliMentionPoller:
         self._logger = logging.getLogger("mysakura.bili")
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._startup_cutoff_seconds = int(time.time())
+        self._seen_notification_ids: set[str] = set()
         self._state = BiliListenerState(
             enabled=config.bili_enable_listener,
             running=False,
@@ -362,6 +392,8 @@ class BiliMentionPoller:
             last_interval_seconds=0,
             poll_count=0,
             consecutive_failures=0,
+            startup_cutoff_seconds=self._startup_cutoff_seconds,
+            skipped_old_count=0,
             paused_reason="",
             last_error="",
         )
@@ -377,6 +409,10 @@ class BiliMentionPoller:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._startup_cutoff_seconds = int(time.time())
+        self._seen_notification_ids.clear()
+        self._state.startup_cutoff_seconds = self._startup_cutoff_seconds
+        self._state.skipped_old_count = 0
         self._state.paused_reason = ""
         self._thread = threading.Thread(target=self._run_loop, name="bili-mention-poller", daemon=True)
         self._thread.start()
@@ -403,7 +439,8 @@ class BiliMentionPoller:
             if self._should_check_login():
                 self._refresh_login_status()
             mentions = self._mention_api.fetch_mentions()
-            self._event_service.process_mentions(mentions)
+            new_mentions = self._filter_mentions_after_startup(mentions)
+            self._event_service.process_mentions(new_mentions)
             self._state.consecutive_failures = 0
             self._state.login_status = "LOGGED_IN"
             self._state.last_error = ""
@@ -422,6 +459,21 @@ class BiliMentionPoller:
         self._state.login_status = "LOGGED_IN"
         self._state.account_mid = account["mid"]
         self._state.account_name = account["uname"]
+
+    def _filter_mentions_after_startup(self, mentions: list[BiliMentionItem]) -> list[BiliMentionItem]:
+        """Process only @ notifications created after this listener process started."""
+        new_mentions = [
+            mention
+            for mention in mentions
+            if (
+                mention.notification_id
+                and mention.timestamp_seconds > self._startup_cutoff_seconds
+                and mention.notification_id not in self._seen_notification_ids
+            )
+        ]
+        self._seen_notification_ids.update(mention.notification_id for mention in new_mentions)
+        self._state.skipped_old_count += len(mentions) - len(new_mentions)
+        return new_mentions
 
     def _handle_bili_api_error(self, exc: BiliApiError) -> None:
         """Classify B 站 errors so account-risk signals stop the poller immediately."""

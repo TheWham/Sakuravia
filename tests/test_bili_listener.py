@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.config import AppConfig
 from app.models import BiliDeliveryStatus, BiliEventStatus, MailStatus, TaskStatus
-from app.services.bili_listener import BiliApiError, BiliEventService, BiliMentionItem, BiliMentionPoller
+from app.services.bili_listener import BiliApiError, BiliEventService, BiliMentionApi, BiliMentionItem, BiliMentionPoller
 from app.storage import TaskRepository
 
 
@@ -26,6 +26,57 @@ class BiliListenerConfigTests(unittest.TestCase):
         self.assertFalse(state.running)
         self.assertEqual(state.login_status, "CONFIG_ERROR")
         self.assertIn("BILI_COOKIE", state.last_error)
+
+    def test_mention_api_parses_at_time_as_timestamp(self) -> None:
+        """The @ feed timestamp is required for startup-time filtering."""
+        api = BiliMentionApi(FakeHttpClient([
+            {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {
+                            "id": "n-at-time",
+                            "at_time": 1001,
+                            "user": {"mid": "100", "nickname": "测试用户"},
+                            "item": {
+                                "target_id": "c1",
+                                "source_content": "@mysakura BV1time11111",
+                            },
+                        }
+                    ]
+                },
+            }
+        ]), "1")
+
+        mentions = api.fetch_mentions()
+
+        self.assertEqual(mentions[0].notification_id, "n-at-time")
+        self.assertEqual(mentions[0].timestamp_seconds, 1001)
+
+    def test_mention_api_normalizes_millisecond_timestamp(self) -> None:
+        """Some loose API fields may use millisecond timestamps."""
+        api = BiliMentionApi(FakeHttpClient([
+            {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {
+                            "id": "n-ms",
+                            "user": {"mid": "100", "nickname": "测试用户"},
+                            "item": {
+                                "target_id": "c1",
+                                "ctime": 1_001_000_000_000,
+                                "source_content": "@mysakura BV1time22222",
+                            },
+                        }
+                    ]
+                },
+            }
+        ]), "1")
+
+        mentions = api.fetch_mentions()
+
+        self.assertEqual(mentions[0].timestamp_seconds, 1_001_000_000)
 
     def test_poll_once_checks_login_on_first_and_tenth_poll_only(self) -> None:
         """Normal polling should not hit the account nav endpoint on every loop."""
@@ -46,6 +97,82 @@ class BiliListenerConfigTests(unittest.TestCase):
         poller.poll_once()
         self.assertEqual(auth_service.check_count, 2)
         self.assertEqual(mention_api.fetch_count, 10)
+
+    def test_poll_processes_only_mentions_after_startup_time(self) -> None:
+        """Old @ messages can reappear in the feed, but should not be processed."""
+        mention_api = FakeMentionApi(
+            batches=[
+                [
+                    _mention("old-1", "BV1old111111", timestamp_seconds=900),
+                    _mention("new-1", "BV1new111111", timestamp_seconds=1001),
+                ],
+            ]
+        )
+        event_service = FakeEventService()
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            event_service,
+        )
+        poller._startup_cutoff_seconds = 1000
+        poller.snapshot().startup_cutoff_seconds = 1000
+
+        poller.poll_once()
+        state = poller.snapshot()
+
+        self.assertEqual(state.skipped_old_count, 1)
+        self.assertEqual(
+            [[mention.notification_id for mention in batch] for batch in event_service.processed_batches],
+            [["new-1"]],
+        )
+
+    def test_timestamp_filter_deduplicates_new_mentions_across_polls(self) -> None:
+        """A new notification should only reach event handling once per process."""
+        mention_api = FakeMentionApi(
+            batches=[
+                [_mention("new-1", "BV1new111111", timestamp_seconds=1001)],
+                [
+                    _mention("new-1", "BV1new111111", timestamp_seconds=1001),
+                    _mention("new-2", "BV1new222222", timestamp_seconds=1002),
+                ],
+            ]
+        )
+        event_service = FakeEventService()
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            event_service,
+        )
+        poller._startup_cutoff_seconds = 1000
+        poller.snapshot().startup_cutoff_seconds = 1000
+
+        poller.poll_once()
+        poller.poll_once()
+
+        self.assertEqual(
+            [[mention.notification_id for mention in batch] for batch in event_service.processed_batches],
+            [["new-1"], ["new-2"]],
+        )
+
+    def test_mentions_without_timestamp_are_skipped(self) -> None:
+        """A missing B 站 timestamp is treated as unsafe to avoid old-message resends."""
+        mention_api = FakeMentionApi(batches=[[_mention("missing-time", "BV1miss11111")]])
+        event_service = FakeEventService()
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            event_service,
+        )
+        poller._startup_cutoff_seconds = 1000
+        poller.snapshot().startup_cutoff_seconds = 1000
+
+        poller.poll_once()
+
+        self.assertEqual(poller.snapshot().skipped_old_count, 1)
+        self.assertEqual(event_service.processed_batches, [])
 
     def test_schedule_next_poll_uses_configured_random_range(self) -> None:
         """The visible next-poll interval should stay inside the configured range."""
@@ -257,26 +384,50 @@ class FakeAuthService:
         return {"mid": "1", "uname": "tester"}
 
 
+class FakeHttpClient:
+    """Return scripted B 站 API payloads for parser-level tests."""
+
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.responses = responses
+
+    def get_json(self, url: str, params: dict[str, object] | None = None) -> dict[str, object]:
+        return self.responses.pop(0)
+
+
 class FakeMentionApi:
     """Small @ feed double that can count or script fetches."""
 
-    def __init__(self, mentions: list[BiliMentionItem] | None = None, errors: list[Exception] | None = None) -> None:
+    def __init__(
+        self,
+        mentions: list[BiliMentionItem] | None = None,
+        errors: list[Exception] | None = None,
+        batches: list[list[BiliMentionItem]] | None = None,
+    ) -> None:
         self.mentions = mentions or []
         self.errors = errors or []
+        self.batches = batches or []
         self.fetch_count = 0
 
     def fetch_mentions(self) -> list[BiliMentionItem]:
         self.fetch_count += 1
         if self.errors:
             raise self.errors.pop(0)
+        if self.batches:
+            return self.batches.pop(0)
         return self.mentions
 
 
 class FakeEventService:
     """Unused by config-error test, but required by the poller constructor."""
 
+    def __init__(self) -> None:
+        self.processed_batches: list[list[BiliMentionItem]] = []
+        self.call_count = 0
+
     def process_mentions(self, mentions: list[BiliMentionItem]) -> None:
-        return None
+        self.call_count += 1
+        if mentions:
+            self.processed_batches.append(mentions)
 
 
 class FakeMailService:
@@ -324,4 +475,17 @@ def _config(
         bili_poll_min_seconds=poll_min,
         bili_poll_max_seconds=poll_max,
         bili_poll_interval_seconds=poll_min,
+    )
+
+
+def _mention(notification_id: str, bvid: str, timestamp_seconds: int = 0) -> BiliMentionItem:
+    """Build a valid mention item for poller-level tests."""
+    return BiliMentionItem(
+        notification_id=notification_id,
+        comment_id=f"comment-{notification_id}",
+        sender_mid="100",
+        sender_name="测试用户",
+        content=f"@mysakura 请总结 {bvid}",
+        mentions_self=True,
+        timestamp_seconds=timestamp_seconds,
     )
