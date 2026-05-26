@@ -235,6 +235,9 @@ def _render_index_html(
     listener_status = escape(str(listener_state.get("login_status", "UNKNOWN")))
     listener_running = "运行中" if listener_state.get("running") else "未运行"
     listener_error = escape(str(listener_state.get("last_error", "")))
+    listener_next_poll = escape(str(listener_state.get("next_poll_at") or "暂无"))
+    listener_interval = escape(str(listener_state.get("last_interval_seconds") or "暂无"))
+    listener_paused = escape(str(listener_state.get("paused_reason") or "无"))
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -521,6 +524,9 @@ def _render_index_html(
         <div class="meta-line">状态：<span id="bili-login-status">{listener_status}</span> / <span id="bili-running-status">{listener_running}</span></div>
         <div class="meta-line">账号：<span id="bili-account">暂无</span></div>
         <div class="meta-line">最近轮询：<span id="bili-last-poll">暂无</span></div>
+        <div class="meta-line">下次轮询：<span id="bili-next-poll">{listener_next_poll}</span></div>
+        <div class="meta-line">本次间隔：<span id="bili-last-interval">{listener_interval}</span> 秒</div>
+        <div class="meta-line">暂停原因：<span id="bili-paused-reason">{listener_paused}</span></div>
         <div id="bili-error" class="danger">{listener_error or "无"}</div>
         <a class="manage-link" href="/v2/users">查看用户状态</a>
       </div>
@@ -613,6 +619,9 @@ def _render_index_html(
         ? `${{state.account_name}} (${{state.account_mid || 'unknown'}})`
         : '暂无';
       document.getElementById('bili-last-poll').textContent = state.last_poll_at || '暂无';
+      document.getElementById('bili-next-poll').textContent = state.next_poll_at || '暂无';
+      document.getElementById('bili-last-interval').textContent = state.last_interval_seconds || '暂无';
+      document.getElementById('bili-paused-reason').textContent = state.paused_reason || '无';
       document.getElementById('bili-error').textContent = state.last_error || '无';
     }}
 
@@ -887,6 +896,9 @@ def _render_v2_users_html(
     listener_status = escape(str(listener_state.get("login_status", "UNKNOWN")))
     listener_running = "运行中" if listener_state.get("running") else "未运行"
     listener_error = escape(str(listener_state.get("last_error") or "无"))
+    listener_next_poll = escape(str(listener_state.get("next_poll_at") or "暂无"))
+    listener_interval = escape(str(listener_state.get("last_interval_seconds") or "暂无"))
+    listener_paused = escape(str(listener_state.get("paused_reason") or "无"))
     user_list_html = _render_v2_user_list_html(users, selected_uid)
     selected_uid_json = json.dumps(selected_uid, ensure_ascii=False)
 
@@ -1171,6 +1183,9 @@ def _render_v2_users_html(
         <div class="meta">状态：<span id="v2-login-status">{listener_status}</span> / <span id="v2-running-status">{listener_running}</span></div>
         <div class="meta">账号：<span id="v2-account">暂无</span></div>
         <div class="meta">最近轮询：<span id="v2-last-poll">暂无</span></div>
+        <div class="meta">下次轮询：<span id="v2-next-poll">{listener_next_poll}</span></div>
+        <div class="meta">本次间隔：<span id="v2-last-interval">{listener_interval}</span> 秒</div>
+        <div class="meta">暂停原因：<span id="v2-paused-reason">{listener_paused}</span></div>
         <div id="v2-error" class="danger">{listener_error}</div>
       </div>
       <div>
@@ -1262,6 +1277,9 @@ def _render_v2_users_html(
         ? `${{state.account_name}} (${{state.account_mid || 'unknown'}})`
         : '暂无';
       document.getElementById('v2-last-poll').textContent = state.last_poll_at || '暂无';
+      document.getElementById('v2-next-poll').textContent = state.next_poll_at || '暂无';
+      document.getElementById('v2-last-interval').textContent = state.last_interval_seconds || '暂无';
+      document.getElementById('v2-paused-reason').textContent = state.paused_reason || '无';
       document.getElementById('v2-error').textContent = state.last_error || '无';
     }}
 

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
+import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from typing import Any
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
@@ -41,6 +44,7 @@ class BiliMentionItem:
     sender_name: str
     content: str
     mentions_self: bool
+    timestamp_seconds: int = 0
 
 
 @dataclass(slots=True)
@@ -53,6 +57,13 @@ class BiliListenerState:
     account_mid: str
     account_name: str
     last_poll_at: str
+    next_poll_at: str
+    last_interval_seconds: int
+    poll_count: int
+    consecutive_failures: int
+    startup_cutoff_seconds: int
+    skipped_old_count: int
+    paused_reason: str
     last_error: str
 
     def to_dict(self) -> dict[str, object]:
@@ -150,6 +161,7 @@ class BiliMentionApi:
         mentions_self = self._mentions_self(nested_item.get("at_details"))
         if not notification_id:
             notification_id = f"{comment_id}:{sender_mid}:{hash(content)}"
+        timestamp_seconds = self._parse_timestamp_seconds(item, nested_item)
         return BiliMentionItem(
             notification_id=notification_id,
             comment_id=comment_id,
@@ -157,7 +169,30 @@ class BiliMentionApi:
             sender_name=sender_name,
             content=content,
             mentions_self=mentions_self,
+            timestamp_seconds=timestamp_seconds,
         )
+
+    def _parse_timestamp_seconds(self, item: dict[str, Any], nested_item: dict[str, Any]) -> int:
+        """Read the notification timestamp from the loose B 站 @ feed shape."""
+        for source in (item, nested_item):
+            for key in ("at_time", "ctime", "timestamp", "time", "notify_time", "created_at"):
+                value = source.get(key)
+                timestamp = self._normalize_timestamp(value)
+                if timestamp > 0:
+                    return timestamp
+        return 0
+
+    def _normalize_timestamp(self, value: object) -> int:
+        """Convert common second/millisecond timestamp values to Unix seconds."""
+        if value is None:
+            return 0
+        try:
+            timestamp = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return 0
+        if timestamp > 10_000_000_000:
+            timestamp //= 1000
+        return timestamp
 
     def _mentions_self(self, at_details: object) -> bool:
         """Check at_details when Bilibili includes it; otherwise trust the @ feed."""
@@ -325,6 +360,11 @@ class BiliEventService:
 class BiliMentionPoller:
     """Background scheduler that periodically polls Bilibili @ notifications."""
 
+    _AUTH_CHECK_EVERY_POLLS = 10
+    _FIRST_BACKOFF_RANGE = (300, 600)
+    _SECOND_BACKOFF_RANGE = (600, 1800)
+    _MAX_CONSECUTIVE_FAILURES = 5
+
     def __init__(
         self,
         config: AppConfig,
@@ -339,6 +379,8 @@ class BiliMentionPoller:
         self._logger = logging.getLogger("mysakura.bili")
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._startup_cutoff_seconds = int(time.time())
+        self._seen_notification_ids: set[str] = set()
         self._state = BiliListenerState(
             enabled=config.bili_enable_listener,
             running=False,
@@ -346,6 +388,13 @@ class BiliMentionPoller:
             account_mid="",
             account_name="",
             last_poll_at="",
+            next_poll_at="",
+            last_interval_seconds=0,
+            poll_count=0,
+            consecutive_failures=0,
+            startup_cutoff_seconds=self._startup_cutoff_seconds,
+            skipped_old_count=0,
+            paused_reason="",
             last_error="",
         )
 
@@ -360,6 +409,11 @@ class BiliMentionPoller:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._startup_cutoff_seconds = int(time.time())
+        self._seen_notification_ids.clear()
+        self._state.startup_cutoff_seconds = self._startup_cutoff_seconds
+        self._state.skipped_old_count = 0
+        self._state.paused_reason = ""
         self._thread = threading.Thread(target=self._run_loop, name="bili-mention-poller", daemon=True)
         self._thread.start()
 
@@ -375,25 +429,138 @@ class BiliMentionPoller:
         return self._state
 
     def poll_once(self) -> None:
-        """Run one auth check, one mention fetch, and one task-state synchronization."""
+        """Run one protected mention poll without checking login on every loop."""
+        if self._state.paused_reason:
+            return
+
+        self._state.poll_count += 1
+        self._state.last_poll_at = utc_now_text()
         try:
-            account = self._auth_service.check_login()
-            self._state.login_status = "LOGGED_IN"
-            self._state.account_mid = account["mid"]
-            self._state.account_name = account["uname"]
+            if self._should_check_login():
+                self._refresh_login_status()
             mentions = self._mention_api.fetch_mentions()
-            self._event_service.process_mentions(mentions)
-            self._state.last_poll_at = utc_now_text()
+            new_mentions = self._filter_mentions_after_startup(mentions)
+            self._event_service.process_mentions(new_mentions)
+            self._state.consecutive_failures = 0
+            self._state.login_status = "LOGGED_IN"
             self._state.last_error = ""
+        except BiliApiError as exc:
+            self._handle_bili_api_error(exc)
         except Exception as exc:  # noqa: BLE001 - listener state must show the original reason.
-            self._state.login_status = "ERROR"
-            self._state.last_error = str(exc)
-            self._logger.warning("Bilibili listener poll failed: %s", exc)
+            self._record_retryable_failure(exc)
+
+    def _should_check_login(self) -> bool:
+        """Keep Cookie validation low-frequency so normal loops only hit the @ feed."""
+        return self._state.poll_count == 1 or self._state.poll_count % self._AUTH_CHECK_EVERY_POLLS == 0
+
+    def _refresh_login_status(self) -> None:
+        """Refresh login metadata and fail visibly when the configured Cookie is unsafe."""
+        account = self._auth_service.check_login()
+        self._state.login_status = "LOGGED_IN"
+        self._state.account_mid = account["mid"]
+        self._state.account_name = account["uname"]
+
+    def _filter_mentions_after_startup(self, mentions: list[BiliMentionItem]) -> list[BiliMentionItem]:
+        """Process only @ notifications created after this listener process started."""
+        new_mentions = [
+            mention
+            for mention in mentions
+            if (
+                mention.notification_id
+                and mention.timestamp_seconds > self._startup_cutoff_seconds
+                and mention.notification_id not in self._seen_notification_ids
+            )
+        ]
+        self._seen_notification_ids.update(mention.notification_id for mention in new_mentions)
+        self._state.skipped_old_count += len(mentions) - len(new_mentions)
+        return new_mentions
+
+    def _handle_bili_api_error(self, exc: BiliApiError) -> None:
+        """Classify B 站 errors so account-risk signals stop the poller immediately."""
+        message = str(exc)
+        if self._is_account_risk_error(message):
+            self._pause_for_account_risk(message)
+            return
+        if self._is_auth_related_error(message):
+            try:
+                self._refresh_login_status()
+            except Exception as auth_exc:  # noqa: BLE001 - any auth failure means the Cookie should rest.
+                self._pause_for_account_risk(str(auth_exc))
+                return
+        self._record_retryable_failure(exc)
+
+    def _record_retryable_failure(self, exc: Exception) -> None:
+        """Back off retryable network/API failures without hiding the latest reason."""
+        self._state.login_status = "ERROR"
+        self._state.consecutive_failures += 1
+        self._state.last_error = str(exc)
+        self._logger.warning("Bilibili listener poll failed: %s", exc)
+        if self._state.consecutive_failures > self._MAX_CONSECUTIVE_FAILURES:
+            self._pause(f"连续失败 {self._state.consecutive_failures} 次，已自动暂停，请人工检查网络、Cookie 或 B 站访问状态。")
+
+    def _pause_for_account_risk(self, detail: str) -> None:
+        """Stop polling when B 站 returns a likely risk-control or auth signal."""
+        self._pause(f"疑似风控或 Cookie 异常，已自动暂停：{detail}")
+
+    def _pause(self, reason: str) -> None:
+        """Move the listener into a manual-check state and stop future requests."""
+        self._state.running = False
+        self._state.login_status = "PAUSED"
+        self._state.paused_reason = reason
+        self._state.last_error = reason
+        self._state.next_poll_at = ""
+        self._stop_event.set()
+
+    def _is_account_risk_error(self, message: str) -> bool:
+        """Recognize response text that usually means continuing would increase risk."""
+        lowered = message.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "412",
+                "429",
+                "precondition",
+                "too many requests",
+                "验证码",
+                "风控",
+                "访问受限",
+                "账号异常",
+                "安全验证",
+            )
+        )
+
+    def _is_auth_related_error(self, message: str) -> bool:
+        """Recognize Cookie/login errors and re-check auth before deciding to continue."""
+        lowered = message.lower()
+        return any(marker in lowered for marker in ("cookie", "未登录", "失效", "-101", "login", "登录"))
+
+    def _schedule_next_poll(self) -> int:
+        """Pick the next wait time and expose it to the UI before sleeping."""
+        if self._state.consecutive_failures == 0:
+            lower = self._config.bili_poll_min_seconds
+            upper = self._config.bili_poll_max_seconds
+        elif self._state.consecutive_failures <= 2:
+            lower, upper = self._FIRST_BACKOFF_RANGE
+        else:
+            lower, upper = self._SECOND_BACKOFF_RANGE
+
+        wait_seconds = random.randint(lower, upper)
+        self._state.last_interval_seconds = wait_seconds
+        self._state.next_poll_at = _seconds_from_now_text(wait_seconds)
+        return wait_seconds
 
     def _run_loop(self) -> None:
         """Poll until the app shuts down, without blocking the summary worker."""
         self._state.running = True
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._state.paused_reason:
             self.poll_once()
-            self._stop_event.wait(self._config.bili_poll_interval_seconds)
+            if self._state.paused_reason:
+                break
+            wait_seconds = self._schedule_next_poll()
+            self._stop_event.wait(wait_seconds)
         self._state.running = False
+
+
+def _seconds_from_now_text(seconds: int) -> str:
+    """Return a readable local timestamp for the next scheduled poll."""
+    return (datetime.now() + timedelta(seconds=seconds)).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
