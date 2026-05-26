@@ -270,3 +270,9 @@ BILI_REQUEST_TIMEOUT_SECONDS=15
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## 许可与使用限制
+
+本项目不是 MIT 许可，也不是开放商用许可。项目仅供作者个人学习、研究和本机自用，未经作者书面许可不得用于商业用途、对外付费服务、SaaS 服务、商业产品集成、转售分发或违反第三方平台规则的批量处理场景。
+
+完整条款见 [LICENSE](LICENSE)。
