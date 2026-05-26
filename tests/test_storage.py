@@ -314,12 +314,54 @@ class TaskServiceTests(unittest.TestCase):
         self.assertEqual(mail_service.send_count, 1)
         self.assertEqual(bili_service.fetch_metadata_count, 0)
 
+    def test_successful_asr_task_deletes_local_audio_by_default(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "asr_audio")
+        self.assertEqual(final_task.audio_file_path, "")
+        self.assertFalse(audio_service.last_audio_path.exists())
+
+    def test_failed_asr_task_keeps_local_audio_for_retry(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FailingTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.FAILED)
+        self.assertTrue(audio_service.last_audio_path.exists())
+        self.assertEqual(final_task.audio_file_path, str(audio_service.last_audio_path))
+
 
 class FakeBiliService:
     """Simple stub that keeps the task flow deterministic in tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, has_subtitle: bool = True) -> None:
         self.fetch_metadata_count = 0
+        self.has_subtitle = has_subtitle
 
     def normalize_source(self, source: str) -> str:
         return source
@@ -338,6 +380,8 @@ class FakeBiliService:
         return self.fetch_metadata(bvid)
 
     def fetch_subtitles(self, metadata: VideoMetadata) -> TranscriptResult:
+        if not self.has_subtitle:
+            return None
         return TranscriptResult(source="official_subtitle", full_text="第一段\n第二段")
 
 
@@ -346,11 +390,11 @@ class FakeAudioService:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.last_audio_path = self.root / "sample.m4a"
 
     def download_audio(self, metadata: VideoMetadata) -> Path:
-        file_path = self.root / "sample.m4a"
-        file_path.write_bytes(b"test")
-        return file_path
+        self.last_audio_path.write_bytes(b"test")
+        return self.last_audio_path
 
     def split_audio(self, audio_path: Path, chunk_seconds: int = 600) -> list[Path]:
         return [audio_path]
@@ -361,6 +405,13 @@ class FakeTranscriptionService:
 
     def transcribe_audio(self, audio_path: Path) -> TranscriptResult:
         return TranscriptResult(source="asr_audio", full_text="转写内容")
+
+
+class FailingTranscriptionService:
+    """Raise after audio download so retry artifacts can be asserted."""
+
+    def transcribe_audio(self, audio_path: Path) -> TranscriptResult:
+        raise RuntimeError("ASR 失败")
 
 
 class FakeSummaryService:

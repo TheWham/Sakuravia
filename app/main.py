@@ -69,6 +69,7 @@ def build_app() -> FastAPI:
         summary_service=summary_service,
         artifact_service=artifact_service,
         mail_service=mail_service,
+        keep_audio_after_success=config.keep_audio_after_success,
     )
     task_service.recover_interrupted_tasks()
     bili_http_client = BiliHttpClient(config)

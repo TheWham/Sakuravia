@@ -55,6 +55,18 @@ class AppConfig:
     smtp_use_ssl: bool
     mail_from: str
     mail_to: str
+    keep_audio_after_success: bool = False
+    asr_provider: str = "aliyun_paraformer"
+    aliyun_dashscope_api_key: str = ""
+    aliyun_asr_model: str = "paraformer-v2"
+    aliyun_oss_access_key_id: str = ""
+    aliyun_oss_access_key_secret: str = ""
+    aliyun_oss_endpoint: str = ""
+    aliyun_oss_bucket: str = ""
+    aliyun_oss_public_base_url: str = ""
+    aliyun_oss_signed_url_expires_seconds: int = 3600
+    aliyun_asr_poll_interval_seconds: int = 5
+    aliyun_asr_timeout_seconds: int = 1800
     bili_enable_listener: bool = False
     bili_cookie: str = ""
     bili_self_mid: str = ""
@@ -78,6 +90,7 @@ class AppConfig:
             sqlite_path=sqlite_path,
             output_dir=output_dir,
             audio_dir=audio_dir,
+            keep_audio_after_success=_get_setting("KEEP_AUDIO_AFTER_SUCCESS", file_values, "false").lower() == "true",
             tmp_dir=tmp_dir,
             yt_dlp_bin=_get_setting("YT_DLP_BIN", file_values, "yt-dlp"),
             ffmpeg_bin=_get_setting("FFMPEG_BIN", file_values, "ffmpeg"),
@@ -93,6 +106,21 @@ class AppConfig:
             smtp_use_ssl=_get_setting("SMTP_USE_SSL", file_values, "true").lower() == "true",
             mail_from=_get_setting("MAIL_FROM", file_values),
             mail_to=_get_setting("MAIL_TO", file_values),
+            asr_provider=_get_setting("ASR_PROVIDER", file_values, "aliyun_paraformer"),
+            aliyun_dashscope_api_key=_get_setting("ALIYUN_DASHSCOPE_API_KEY", file_values),
+            aliyun_asr_model=_get_setting("ALIYUN_ASR_MODEL", file_values, "paraformer-v2"),
+            aliyun_oss_access_key_id=_get_setting("ALIYUN_OSS_ACCESS_KEY_ID", file_values),
+            aliyun_oss_access_key_secret=_get_setting("ALIYUN_OSS_ACCESS_KEY_SECRET", file_values),
+            aliyun_oss_endpoint=_get_setting("ALIYUN_OSS_ENDPOINT", file_values),
+            aliyun_oss_bucket=_get_setting("ALIYUN_OSS_BUCKET", file_values),
+            aliyun_oss_public_base_url=_get_setting("ALIYUN_OSS_PUBLIC_BASE_URL", file_values),
+            aliyun_oss_signed_url_expires_seconds=int(
+                _get_setting("ALIYUN_OSS_SIGNED_URL_EXPIRES_SECONDS", file_values, "3600")
+            ),
+            aliyun_asr_poll_interval_seconds=int(
+                _get_setting("ALIYUN_ASR_POLL_INTERVAL_SECONDS", file_values, "5")
+            ),
+            aliyun_asr_timeout_seconds=int(_get_setting("ALIYUN_ASR_TIMEOUT_SECONDS", file_values, "1800")),
             bili_enable_listener=_get_setting("BILI_ENABLE_LISTENER", file_values, "false").lower() == "true",
             bili_cookie=_get_setting("BILI_COOKIE", file_values),
             bili_self_mid=_get_setting("BILI_SELF_MID", file_values),

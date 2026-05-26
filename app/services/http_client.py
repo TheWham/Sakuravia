@@ -33,6 +33,14 @@ class SimpleHttpClient:
             req.add_header(key, value)
         return self._read_json(req)
 
+    def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, object]:
+        """Download a JSON document from a provider-owned result URL."""
+        req = request.Request(url, method="GET")
+        self._add_default_headers(req)
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        return self._read_json(req)
+
     def post_multipart(
         self,
         url: str,

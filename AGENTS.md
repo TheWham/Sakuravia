@@ -7,7 +7,7 @@
 - 提供本地网页
 - 手动输入 `BV` 号或 B 站视频链接
 - 优先读取字幕
-- 无字幕时下载音频并调用 `Groq Whisper`
+- 无字幕时下载音频并调用可切换 ASR，V3 默认使用阿里云百炼 `Paraformer`
 - 调用 `DeepSeek` 生成 Markdown 总结
 - 将 `.md` 文件落盘
 - 通过 `SMTP` 把 `.md` 作为附件发送到固定邮箱
@@ -36,7 +36,7 @@
   - `services/`
     - `bili.py`：BV 解析、视频元信息获取、字幕提取
     - `audio.py`：音频下载与切片
-    - `transcription.py`：Groq Whisper 转写
+    - `transcription.py`：ASR Provider 分发、Groq Whisper 转写、阿里云百炼 Paraformer 转写
     - `summary.py`：DeepSeek Markdown 总结
     - `artifact.py`：Markdown 落盘
     - `mail.py`：SMTP 发信
@@ -55,7 +55,8 @@
 - 进程内 `ThreadPoolExecutor(max_workers=1)`
 - `yt-dlp`
 - `ffmpeg`
-- `Groq Whisper`
+- 阿里云百炼 `Paraformer`（默认 ASR，适合大陆阿里云部署）
+- `Groq Whisper`（保留为可切换旧 Provider）
 - `DeepSeek`
 - `SMTP`
 
@@ -73,7 +74,9 @@
 - `.env`
 - `yt-dlp`
 - `ffmpeg`
-- Groq API Key
+- 阿里云百炼 API Key（`Paraformer` 需使用“中国内地（北京）”地域 API Key）
+- 阿里云 OSS Bucket（V3 默认私有 Bucket + 签名 URL 模式，识别完成后删除临时音频对象）
+- 可选：Groq API Key
 - DeepSeek API Key
 - SMTP 账号
 - 可选：AI 助手 B 站账号 Cookie 和 `BILI_SELF_MID`
@@ -85,6 +88,8 @@
 - Markdown 输出目录默认在 `data/output/`
 - 音频目录默认在 `data/audio/`
 - 临时目录默认在 `data/tmp/`
+- ASR 默认 Provider 是 `aliyun_paraformer`；临时音频上传到 OSS 后通过短时签名 URL 交给百炼
+- `KEEP_AUDIO_AFTER_SUCCESS=false` 时，任务成功后删除本地音频；失败任务保留音频用于排查和重试
 
 ## 代码约束
 
@@ -92,6 +97,8 @@
 
 - 关键业务方法保留详细但克制的注释和 docstring
 - 先保持“字幕优先，音频转写兜底”的处理顺序
+- ASR Provider 必须可切换，不能把任务编排层绑定死到某一家服务商
+- Paraformer 结果 URL 有短期有效期，任务成功后要立即拉取 JSON 并保存文本，不能只保存结果 URL
 - 同一个 `bvid` 在运行中禁止重复创建新任务
 - 邮件接收人维持固定配置，不从页面动态输入
 - 错误信息要落库并在页面可见，不能静默吞错

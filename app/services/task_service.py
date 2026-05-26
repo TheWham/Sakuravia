@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from .bili import BiliResolverService
 from .mail import MailService
 from .summary import SummaryService
 from .transcription import TranscriptionService
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TaskService:
@@ -27,6 +31,7 @@ class TaskService:
         summary_service: SummaryService,
         artifact_service: ArtifactService,
         mail_service: MailService,
+        keep_audio_after_success: bool = False,
     ) -> None:
         self._repository = repository
         self._bili_service = bili_service
@@ -35,6 +40,7 @@ class TaskService:
         self._summary_service = summary_service
         self._artifact_service = artifact_service
         self._mail_service = mail_service
+        self._keep_audio_after_success = keep_audio_after_success
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="summary-worker")
 
     def submit_task(self, source_input: str, reuse_success: bool = False, send_mail: bool = True) -> TaskRecord:
@@ -104,6 +110,7 @@ class TaskService:
                     last_checkpoint="markdown_ready",
                 )
                 self._complete_mail_step(task_id, title, markdown_content, markdown_path)
+                self._cleanup_success_audio(task_id, None)
                 self._set_status(task_id, TaskStatus.SUCCESS)
                 return
 
@@ -151,6 +158,7 @@ class TaskService:
             )
 
             self._complete_mail_step(task_id, metadata.title, summary.markdown, markdown_path)
+            self._cleanup_success_audio(task_id, audio_path)
             self._set_status(task_id, TaskStatus.SUCCESS)
         except Exception as exc:  # noqa: BLE001 - the page needs the original message.
             self._repository.update_task_fields(
@@ -186,6 +194,31 @@ class TaskService:
             self._repository.update_task_fields(task.id, last_checkpoint="audio")
             return audio_path
         return None
+
+    def _cleanup_success_audio(self, task_id: int, audio_path: Path | None) -> None:
+        """Remove local ASR audio after a fully successful task when configured.
+
+        成功后删除音频可以控制 2G/40G 云服务器的长期磁盘占用；失败任务不进
+        这个方法，所以仍会保留音频，便于重试时跳过下载或排查供应商错误。
+        """
+        if self._keep_audio_after_success:
+            return
+
+        task = self._repository.get_task(task_id)
+        if not task.audio_file_path:
+            return
+
+        stored_audio_path = Path(task.audio_file_path)
+        target_path = audio_path if audio_path is not None else stored_audio_path
+        if target_path != stored_audio_path:
+            target_path = stored_audio_path
+
+        try:
+            if target_path.exists() and target_path.is_file():
+                target_path.unlink()
+            self._repository.update_task_fields(task_id, audio_file_path="")
+        except OSError as exc:
+            LOGGER.warning("删除本地成功任务音频失败：%s", exc)
 
     def _load_existing_markdown(self, task: TaskRecord) -> tuple[str, Path] | None:
         """Return a completed Markdown artifact so retry can jump to mail delivery."""
