@@ -39,8 +39,7 @@ class SubtitleOrAudioService:
                 continue
 
         self._process_runner.run(
-            [
-                self._config.yt_dlp_bin,
+            self._build_yt_dlp_args(
                 "-x",
                 "--no-playlist",
                 "--audio-format",
@@ -52,7 +51,7 @@ class SubtitleOrAudioService:
                 "-o",
                 str(output_template),
                 metadata.webpage_url,
-            ],
+            ),
             timeout_seconds=AUDIO_DOWNLOAD_TIMEOUT_SECONDS,
         )
 
@@ -88,3 +87,15 @@ class SubtitleOrAudioService:
         if not chunks:
             raise FileNotFoundError("ffmpeg 切片完成后未生成任何音频分片。")
         return chunks
+
+    def _build_yt_dlp_args(self, *args: str) -> list[str]:
+        """Build yt-dlp arguments with an optional cookies.txt login state.
+
+        服务器环境下 B 站经常对无登录态的机房 IP 返回 412；这里统一给下载
+        分支带上 cookies 文件，避免解析能过但真正下载音频时再次被拦。
+        """
+        command = [self._config.yt_dlp_bin]
+        if self._config.yt_dlp_cookies_file is not None:
+            command.extend(["--cookies", str(self._config.yt_dlp_cookies_file)])
+        command.extend(args)
+        return command

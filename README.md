@@ -44,6 +44,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 - 阿里云安全组只放行你的公网 IP 到 `22/tcp` 和 `80/tcp`
 - 不迁移本机历史任务数据，服务器从空 SQLite 开始
 - 后续买域名并解析到中国内地 ECS 前，先处理 ICP 备案和 HTTPS
+- 如果 ECS 上解析 B 站返回 `HTTP 412`，配置 `YT_DLP_COOKIES_FILE=data/bilibili-cookies.txt`
 
 ## ASR 配置
 

@@ -35,12 +35,11 @@ class BiliResolverService:
         """Ask yt-dlp for metadata for a concrete video URL or BV id."""
         url = self._build_video_url(bvid, source_input)
         output = self._process_runner.run(
-            [
-                self._config.yt_dlp_bin,
+            self._build_yt_dlp_args(
                 "--dump-single-json",
                 "--no-playlist",
                 url,
-            ],
+            ),
             timeout_seconds=METADATA_FETCH_TIMEOUT_SECONDS,
         )
         payload = json.loads(output)
@@ -80,11 +79,10 @@ class BiliResolverService:
         bvid = self.normalize_source(source)
         url = self._build_video_url(bvid, source)
         output = self._process_runner.run(
-            [
-                self._config.yt_dlp_bin,
+            self._build_yt_dlp_args(
                 "--dump-single-json",
                 url,
-            ],
+            ),
             timeout_seconds=METADATA_FETCH_TIMEOUT_SECONDS,
         )
         payload = json.loads(output)
@@ -103,8 +101,7 @@ class BiliResolverService:
         target_prefix = target_dir / metadata.bvid
 
         self._process_runner.run(
-            [
-                self._config.yt_dlp_bin,
+            self._build_yt_dlp_args(
                 "--skip-download",
                 "--no-playlist",
                 "--write-subs",
@@ -116,7 +113,7 @@ class BiliResolverService:
                 "-o",
                 str(target_prefix),
                 metadata.webpage_url,
-            ],
+            ),
             timeout_seconds=SUBTITLE_FETCH_TIMEOUT_SECONDS,
         )
 
@@ -195,6 +192,18 @@ class BiliResolverService:
             if tag:
                 tags.append(tag)
         return tags
+
+    def _build_yt_dlp_args(self, *args: str) -> list[str]:
+        """Build yt-dlp arguments with the optional B 站 cookies file.
+
+        云服务器 IP 容易触发 B 站 412 风控；cookies.txt 只作为 yt-dlp 的
+        登录态输入，不进入页面，也不和 B 站 @ 监听用的 BILI_COOKIE 混用。
+        """
+        command = [self._config.yt_dlp_bin]
+        if self._config.yt_dlp_cookies_file is not None:
+            command.extend(["--cookies", str(self._config.yt_dlp_cookies_file)])
+        command.extend(args)
+        return command
 
     def _parse_video_parts(self, bvid: str, payload: dict[str, object], fallback_url: str) -> list[VideoPart]:
         """Normalize yt-dlp playlist/page entries into UI-friendly choices."""

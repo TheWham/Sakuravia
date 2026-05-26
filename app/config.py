@@ -55,6 +55,7 @@ class AppConfig:
     smtp_use_ssl: bool
     mail_from: str
     mail_to: str
+    yt_dlp_cookies_file: Path | None = None
     keep_audio_after_success: bool = False
     asr_provider: str = "aliyun_paraformer"
     aliyun_dashscope_api_key: str = ""
@@ -83,6 +84,8 @@ class AppConfig:
         output_dir = BASE_DIR / _get_setting("OUTPUT_DIR", file_values, "data/output")
         audio_dir = BASE_DIR / "data/audio"
         tmp_dir = BASE_DIR / "data/tmp"
+        yt_dlp_cookies_file_text = _get_setting("YT_DLP_COOKIES_FILE", file_values).strip()
+        yt_dlp_cookies_file = BASE_DIR / yt_dlp_cookies_file_text if yt_dlp_cookies_file_text else None
 
         return cls(
             app_host=_get_setting("APP_HOST", file_values, "127.0.0.1"),
@@ -93,6 +96,7 @@ class AppConfig:
             keep_audio_after_success=_get_setting("KEEP_AUDIO_AFTER_SUCCESS", file_values, "false").lower() == "true",
             tmp_dir=tmp_dir,
             yt_dlp_bin=_get_setting("YT_DLP_BIN", file_values, "yt-dlp"),
+            yt_dlp_cookies_file=yt_dlp_cookies_file,
             ffmpeg_bin=_get_setting("FFMPEG_BIN", file_values, "ffmpeg"),
             groq_api_key=_get_setting("GROQ_API_KEY", file_values),
             groq_asr_model=_get_setting("GROQ_ASR_MODEL", file_values, "whisper-large-v3-turbo"),

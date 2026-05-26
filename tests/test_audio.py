@@ -44,6 +44,26 @@ class AudioDownloadTests(unittest.TestCase):
             self.assertIn("--ffmpeg-location", runner.args)
             self.assertIn(str(Path(config.ffmpeg_bin).parent), runner.args)
 
+    def test_download_audio_uses_configured_cookies_file(self) -> None:
+        """Audio fallback should use the same B 站 cookies as metadata parsing."""
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            config = _config(root)
+            config.yt_dlp_cookies_file = root / "data" / "bilibili-cookies.txt"
+            metadata = VideoMetadata(
+                bvid="BV1cookie",
+                title="测试视频",
+                uploader="测试UP",
+                duration=60,
+                webpage_url="https://www.bilibili.com/video/BV1cookie",
+            )
+
+            runner = FakeProcessRunner(config.audio_dir)
+            SubtitleOrAudioService(config, runner).download_audio(metadata)
+
+            self.assertIn("--cookies", runner.args)
+            self.assertIn(str(config.yt_dlp_cookies_file), runner.args)
+
 
 class FakeProcessRunner:
     """Capture the command and create the file yt-dlp would leave behind."""

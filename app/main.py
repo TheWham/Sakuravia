@@ -19,7 +19,7 @@ from .services.bili import BiliResolverService
 from .services.bili_listener import BiliAuthService, BiliEventService, BiliHttpClient, BiliMentionApi, BiliMentionPoller
 from .services.http_client import SimpleHttpClient
 from .services.mail import MailService
-from .services.process_runner import ProcessRunner
+from .services.process_runner import ProcessExecutionError, ProcessRunner
 from .services.summary import SummaryService
 from .services.task_service import TaskService
 from .services.transcription import TranscriptionService
@@ -127,6 +127,8 @@ def build_app() -> FastAPI:
             bvid, title, parts = bili_service.inspect_parts(payload.source)
         except ValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ProcessExecutionError as exc:
+            raise HTTPException(status_code=502, detail=f"B 站视频解析失败：{exc}") from exc
         return {"bvid": bvid, "title": title, "parts": [part.to_dict() for part in parts]}
 
     @app.get("/api/tasks")

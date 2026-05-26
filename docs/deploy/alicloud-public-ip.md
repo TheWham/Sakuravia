@@ -109,6 +109,7 @@ nano .env
 APP_HOST=127.0.0.1
 APP_PORT=8000
 YT_DLP_BIN=yt-dlp
+YT_DLP_COOKIES_FILE=data/bilibili-cookies.txt
 FFMPEG_BIN=ffmpeg
 ASR_PROVIDER=aliyun_paraformer
 BILI_ENABLE_LISTENER=false
@@ -129,6 +130,30 @@ BILI_ENABLE_LISTENER=false
 ```
 
 主链路跑通后，再考虑开启 B 站 `@我` 监听。
+
+如果 ECS 上 `yt-dlp` 解析 B 站视频返回 `HTTP Error 412: Precondition Failed`，说明服务器 IP 触发了 B 站风控。用浏览器扩展导出 `bilibili.com` 的 Netscape `cookies.txt`，上传到：
+
+```bash
+mkdir -p /opt/mysakura/data
+vim /opt/mysakura/data/bilibili-cookies.txt
+chmod 600 /opt/mysakura/data/bilibili-cookies.txt
+```
+
+然后先用命令验证：
+
+```bash
+yt-dlp --cookies /opt/mysakura/data/bilibili-cookies.txt \
+  --dump-single-json --no-playlist \
+  "https://www.bilibili.com/video/BV17UG46BEj2"
+```
+
+能输出 JSON 后，保持 `.env` 中：
+
+```dotenv
+YT_DLP_COOKIES_FILE=data/bilibili-cookies.txt
+```
+
+这个文件只给 `yt-dlp` 解析和下载用，和 `.env` 里的 `BILI_COOKIE` 不是同一个配置。不要把 `bilibili-cookies.txt` 提交到 Git。
 
 ## 5. 配置 systemd
 
@@ -225,6 +250,7 @@ ls -lah data/output/
 
 ```dotenv
 YT_DLP_BIN=yt-dlp
+YT_DLP_COOKIES_FILE=data/bilibili-cookies.txt
 FFMPEG_BIN=ffmpeg
 ```
 

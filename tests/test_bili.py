@@ -78,14 +78,35 @@ class BiliResolverMetadataTests(unittest.TestCase):
         self.assertIn("p=1", parts[0].url)
         self.assertIn("p=2", parts[1].url)
 
+    def test_metadata_fetch_uses_configured_cookies_file(self) -> None:
+        """yt-dlp should receive cookies.txt when ECS needs B 站 login state."""
+        payload = {
+            "title": "测试视频",
+            "webpage_url": "https://www.bilibili.com/video/BV1cookie",
+        }
+        config = _config()
+        config.yt_dlp_cookies_file = Path("data/bilibili-cookies.txt")
+        runner = FakeProcessRunner(payload)
+        service = BiliResolverService(config, runner)
+
+        service.fetch_metadata("BV1cookie")
+
+        self.assertIn("--cookies", runner.args)
+        self.assertEqual(
+            runner.args[runner.args.index("--cookies") + 1],
+            str(config.yt_dlp_cookies_file),
+        )
+
 
 class FakeProcessRunner:
     """Return a stable yt-dlp JSON payload."""
 
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
+        self.args: list[str] = []
 
     def run(self, args: list[str], cwd: Path | None = None, timeout_seconds: int | None = None) -> str:
+        self.args = args
         return json.dumps(self.payload, ensure_ascii=False)
 
 
