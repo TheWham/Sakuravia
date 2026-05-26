@@ -278,8 +278,10 @@ BILI_REQUEST_TIMEOUT_SECONDS=15
 python -m unittest discover -s tests -v
 ```
 
-## 许可与使用限制
+## 许可
 
-本项目不是 MIT 许可，也不是开放商用许可。项目仅供作者个人学习、研究和本机自用，未经作者书面许可不得用于商业用途、对外付费服务、SaaS 服务、商业产品集成、转售分发或违反第三方平台规则的批量处理场景。
+本项目采用 Apache License 2.0。你可以在遵守该协议的前提下使用、复制、修改和分发本项目。
+
+本项目会调用 B 站、Groq、DeepSeek、SMTP 等第三方服务，实际使用时仍需自行遵守对应平台的服务条款和风控规则。
 
 完整条款见 [LICENSE](LICENSE)。
