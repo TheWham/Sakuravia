@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.config import AppConfig
 from app.models import BiliDeliveryStatus, BiliEventStatus, MailStatus, TaskStatus
-from app.services.bili_listener import BiliEventService, BiliListenerState, BiliMentionItem, BiliMentionPoller
+from app.services.bili_listener import BiliApiError, BiliEventService, BiliMentionItem, BiliMentionPoller
 from app.storage import TaskRepository
 
 
@@ -26,6 +26,95 @@ class BiliListenerConfigTests(unittest.TestCase):
         self.assertFalse(state.running)
         self.assertEqual(state.login_status, "CONFIG_ERROR")
         self.assertIn("BILI_COOKIE", state.last_error)
+
+    def test_poll_once_checks_login_on_first_and_tenth_poll_only(self) -> None:
+        """Normal polling should not hit the account nav endpoint on every loop."""
+        auth_service = FakeAuthService()
+        mention_api = FakeMentionApi()
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            auth_service,
+            mention_api,
+            FakeEventService(),
+        )
+
+        for _ in range(9):
+            poller.poll_once()
+        self.assertEqual(auth_service.check_count, 1)
+        self.assertEqual(mention_api.fetch_count, 9)
+
+        poller.poll_once()
+        self.assertEqual(auth_service.check_count, 2)
+        self.assertEqual(mention_api.fetch_count, 10)
+
+    def test_schedule_next_poll_uses_configured_random_range(self) -> None:
+        """The visible next-poll interval should stay inside the configured range."""
+        config = _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True, poll_min=180, poll_max=480)
+        poller = BiliMentionPoller(config, FakeAuthService(), FakeMentionApi(), FakeEventService())
+
+        for _ in range(20):
+            wait_seconds = poller._schedule_next_poll()
+            self.assertGreaterEqual(wait_seconds, 180)
+            self.assertLessEqual(wait_seconds, 480)
+            self.assertEqual(poller.snapshot().last_interval_seconds, wait_seconds)
+            self.assertTrue(poller.snapshot().next_poll_at)
+
+    def test_retryable_failure_enters_first_backoff_range(self) -> None:
+        """Temporary failures should back off instead of pausing immediately."""
+        mention_api = FakeMentionApi(errors=[RuntimeError("temporary network error")])
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            FakeEventService(),
+        )
+
+        poller.poll_once()
+        state = poller.snapshot()
+
+        self.assertEqual(state.login_status, "ERROR")
+        self.assertEqual(state.consecutive_failures, 1)
+        self.assertFalse(state.paused_reason)
+
+        wait_seconds = poller._schedule_next_poll()
+        self.assertGreaterEqual(wait_seconds, 300)
+        self.assertLessEqual(wait_seconds, 600)
+
+    def test_risk_control_error_pauses_listener(self) -> None:
+        """412/429/captcha-style responses should stop future B 站 requests."""
+        mention_api = FakeMentionApi(errors=[BiliApiError("HTTP Error 412: Precondition Failed")])
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            FakeEventService(),
+        )
+
+        poller.poll_once()
+        state = poller.snapshot()
+
+        self.assertEqual(state.login_status, "PAUSED")
+        self.assertIn("疑似风控", state.paused_reason)
+        self.assertIn("412", state.last_error)
+
+        poller.poll_once()
+        self.assertEqual(mention_api.fetch_count, 1)
+
+    def test_run_loop_stops_after_pause(self) -> None:
+        """A paused listener should leave the background loop without sleeping forever."""
+        mention_api = FakeMentionApi(errors=[BiliApiError("B 站接口返回错误：429 Too Many Requests")])
+        poller = BiliMentionPoller(
+            _config(Path(tempfile.gettempdir()), enable_listener=True, with_credentials=True),
+            FakeAuthService(),
+            mention_api,
+            FakeEventService(),
+        )
+
+        poller._run_loop()
+
+        self.assertFalse(poller.snapshot().running)
+        self.assertEqual(mention_api.fetch_count, 1)
+        self.assertTrue(poller.snapshot().paused_reason)
 
 
 class BiliEventServiceTests(unittest.TestCase):
@@ -155,17 +244,32 @@ class FakeTaskService:
 
 
 class FakeAuthService:
-    """Unused by config-error test, but required by the poller constructor."""
+    """Small auth double that can count or script login checks."""
+
+    def __init__(self, errors: list[Exception] | None = None) -> None:
+        self.errors = errors or []
+        self.check_count = 0
 
     def check_login(self) -> dict[str, str]:
+        self.check_count += 1
+        if self.errors:
+            raise self.errors.pop(0)
         return {"mid": "1", "uname": "tester"}
 
 
 class FakeMentionApi:
-    """Unused by config-error test, but required by the poller constructor."""
+    """Small @ feed double that can count or script fetches."""
+
+    def __init__(self, mentions: list[BiliMentionItem] | None = None, errors: list[Exception] | None = None) -> None:
+        self.mentions = mentions or []
+        self.errors = errors or []
+        self.fetch_count = 0
 
     def fetch_mentions(self) -> list[BiliMentionItem]:
-        return []
+        self.fetch_count += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.mentions
 
 
 class FakeEventService:
@@ -185,7 +289,13 @@ class FakeMailService:
         self.sent_to.append(to_email or "")
 
 
-def _config(root: Path, enable_listener: bool = False) -> AppConfig:
+def _config(
+    root: Path,
+    enable_listener: bool = False,
+    with_credentials: bool = False,
+    poll_min: int = 180,
+    poll_max: int = 480,
+) -> AppConfig:
     """Build the minimal config needed by Bili listener tests."""
     return AppConfig(
         app_host="127.0.0.1",
@@ -209,4 +319,9 @@ def _config(root: Path, enable_listener: bool = False) -> AppConfig:
         mail_from="",
         mail_to="",
         bili_enable_listener=enable_listener,
+        bili_cookie="SESSDATA=test" if with_credentials else "",
+        bili_self_mid="1" if with_credentials else "",
+        bili_poll_min_seconds=poll_min,
+        bili_poll_max_seconds=poll_max,
+        bili_poll_interval_seconds=poll_min,
     )

@@ -259,11 +259,16 @@ V2 监听默认关闭。需要使用时，在 `.env` 中配置：
 BILI_ENABLE_LISTENER=true
 BILI_COOKIE=浏览器里复制出来的 AI 助手 B 站账号完整 Cookie
 BILI_SELF_MID=AI 助手 B 站账号 MID
-BILI_POLL_INTERVAL_SECONDS=60
+BILI_POLL_MIN_SECONDS=180
+BILI_POLL_MAX_SECONDS=480
 BILI_REQUEST_TIMEOUT_SECONDS=15
 ```
 
 开启后重启服务。别人评论里 `@AI助手账号 BVxxxx` 或 `@AI助手账号 https://www.bilibili.com/video/BV...` 时，系统会在本地记录事件并创建或复用任务。邮件收件人来自本地“用户邮箱簿”中该评论用户 UID 对应的邮箱；未绑定邮箱的用户不会创建任务。当前版本只发邮件和本地展示，不自动回复 B 站评论。
+
+为降低风控风险，V3 默认不再使用固定 60 秒轮询，而是在 `BILI_POLL_MIN_SECONDS` 到 `BILI_POLL_MAX_SECONDS` 之间随机等待。推荐保持 `180-480` 秒，@ 触发会有 3-8 分钟延迟，但更适合长期常开。旧配置 `BILI_POLL_INTERVAL_SECONDS` 仍兼容；如果没有配置新的最小/最大值，系统会把旧值当作固定轮询间隔。
+
+监听器还会做保护性退避：普通网络异常会自动降频重试；连续失败过多，或遇到 `412`、`429`、验证码、访问受限、Cookie 失效等疑似风控/账号异常信号时，会自动暂停监听并在页面显示原因，避免继续请求 B 站。
 
 ## 测试
 

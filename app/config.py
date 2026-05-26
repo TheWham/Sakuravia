@@ -31,6 +31,23 @@ def _get_setting(name: str, file_values: dict[str, str], default: str = "") -> s
     return os.getenv(name, file_values.get(name, default))
 
 
+def _normalize_bili_poll_range(file_values: dict[str, str]) -> tuple[int, int]:
+    """Return the listener poll range while keeping old fixed-interval config usable."""
+    legacy_interval = _get_setting("BILI_POLL_INTERVAL_SECONDS", file_values).strip()
+    min_text = _get_setting("BILI_POLL_MIN_SECONDS", file_values).strip()
+    max_text = _get_setting("BILI_POLL_MAX_SECONDS", file_values).strip()
+
+    if not min_text and not max_text and legacy_interval:
+        min_seconds = max_seconds = int(legacy_interval)
+    else:
+        min_seconds = int(min_text or "180")
+        max_seconds = int(max_text or "480")
+
+    min_seconds = max(60, min_seconds)
+    max_seconds = max(min_seconds, max_seconds)
+    return min_seconds, max_seconds
+
+
 @dataclass(slots=True)
 class AppConfig:
     """Runtime settings used across the whole application."""
@@ -72,6 +89,8 @@ class AppConfig:
     bili_cookie: str = ""
     bili_self_mid: str = ""
     bili_poll_interval_seconds: int = 60
+    bili_poll_min_seconds: int = 180
+    bili_poll_max_seconds: int = 480
     bili_request_timeout_seconds: int = 15
 
     @classmethod
@@ -86,6 +105,7 @@ class AppConfig:
         tmp_dir = BASE_DIR / "data/tmp"
         yt_dlp_cookies_file_text = _get_setting("YT_DLP_COOKIES_FILE", file_values).strip()
         yt_dlp_cookies_file = BASE_DIR / yt_dlp_cookies_file_text if yt_dlp_cookies_file_text else None
+        bili_poll_min_seconds, bili_poll_max_seconds = _normalize_bili_poll_range(file_values)
 
         return cls(
             app_host=_get_setting("APP_HOST", file_values, "127.0.0.1"),
@@ -128,7 +148,9 @@ class AppConfig:
             bili_enable_listener=_get_setting("BILI_ENABLE_LISTENER", file_values, "false").lower() == "true",
             bili_cookie=_get_setting("BILI_COOKIE", file_values),
             bili_self_mid=_get_setting("BILI_SELF_MID", file_values),
-            bili_poll_interval_seconds=int(_get_setting("BILI_POLL_INTERVAL_SECONDS", file_values, "60")),
+            bili_poll_interval_seconds=bili_poll_min_seconds,
+            bili_poll_min_seconds=bili_poll_min_seconds,
+            bili_poll_max_seconds=bili_poll_max_seconds,
             bili_request_timeout_seconds=int(_get_setting("BILI_REQUEST_TIMEOUT_SECONDS", file_values, "15")),
         )
 
