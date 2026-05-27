@@ -12,7 +12,12 @@ from .process_runner import ProcessRunner
 
 
 AUDIO_DOWNLOAD_TIMEOUT_SECONDS = 3600
+VIDEO_DOWNLOAD_TIMEOUT_SECONDS = 3600
 AUDIO_SPLIT_TIMEOUT_SECONDS = 1200
+AUDIO_NORMALIZE_TIMEOUT_SECONDS = 1200
+VIDEO_NORMALIZE_TIMEOUT_SECONDS = 3600
+MIMO_AUDIO_SUFFIXES = {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
+DOWNLOAD_AUDIO_SUFFIXES = {*MIMO_AUDIO_SUFFIXES, ".webm", ".aac"}
 
 
 class SubtitleOrAudioService:
@@ -41,7 +46,7 @@ class SubtitleOrAudioService:
                 "-x",
                 "--no-playlist",
                 "--audio-format",
-                "m4a",
+                "mp3",
                 *self._build_ffmpeg_location_args(),
                 "--no-part",
                 "--force-overwrites",
@@ -54,9 +59,46 @@ class SubtitleOrAudioService:
 
         audio_files = sorted(run_dir.glob(f"{metadata.bvid}.*"))
         for audio_file in audio_files:
-            if audio_file.suffix.lower() in {".m4a", ".mp3", ".wav", ".webm", ".aac", ".flac", ".ogg"}:
+            if audio_file.suffix.lower() == ".mp3":
                 return audio_file
+        for audio_file in audio_files:
+            if audio_file.suffix.lower() in DOWNLOAD_AUDIO_SUFFIXES:
+                return self._normalize_audio_for_mimo(audio_file)
         raise FileNotFoundError("yt-dlp 下载完成后未找到音频文件。")
+
+    def download_video(self, metadata: VideoMetadata) -> Path:
+        """Download a single playable video file for Mimo video understanding.
+
+        视频理解只作为 V4 的兜底或手动增强路径。这里仍按每次任务单独 run 目录
+        保存，避免上一次失败留下的临时文件影响本次判断和 OSS 上传。
+        """
+        video_dir = self._config.audio_dir / metadata.bvid
+        run_dir = video_dir / f"video_{datetime.utcnow():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        output_template = run_dir / f"{metadata.bvid}.%(ext)s"
+
+        self._process_runner.run(
+            self._build_yt_dlp_args(
+                "--no-playlist",
+                "-f",
+                "bv*+ba/b",
+                "--merge-output-format",
+                "mp4",
+                *self._build_ffmpeg_location_args(),
+                "--no-part",
+                "--force-overwrites",
+                "-o",
+                str(output_template),
+                metadata.webpage_url,
+            ),
+            timeout_seconds=VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+
+        video_files = sorted(run_dir.glob(f"{metadata.bvid}.*"))
+        for video_file in video_files:
+            if video_file.suffix.lower() in {".mp4", ".mov", ".avi", ".wmv"}:
+                return self._normalize_video_for_mimo(video_file)
+        raise FileNotFoundError("yt-dlp 下载完成后未找到视频文件。")
 
     def split_audio(self, audio_path: Path, chunk_seconds: int = 600) -> list[Path]:
         """Split large audio files into fixed-size chunks accepted by the ASR provider."""
@@ -96,6 +138,73 @@ class SubtitleOrAudioService:
             command.extend(["--cookies", str(self._config.yt_dlp_cookies_file)])
         command.extend(args)
         return command
+
+    def _normalize_audio_for_mimo(self, audio_path: Path) -> Path:
+        """Convert yt-dlp fallback formats into a conservative MP3 for Mimo.
+
+        Mimo 的音频 URL 方式只接受 MP3、WAV、FLAC、M4A、OGG。B 站偶尔会让
+        yt-dlp 留下 m4a/webm/aac 等中间结果。官方也提示格式变体不保证都识别，
+        所以这里统一转成兼容性更稳的 MP3，避免把供应商格式错误暴露到最后一步。
+        """
+        target_path = audio_path.with_suffix(".mp3")
+        if target_path == audio_path:
+            return audio_path
+        self._process_runner.run(
+            [
+                self._config.ffmpeg_bin,
+                "-y",
+                "-i",
+                str(audio_path),
+                "-vn",
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                str(target_path),
+            ],
+            timeout_seconds=AUDIO_NORMALIZE_TIMEOUT_SECONDS,
+        )
+        if not target_path.exists() or target_path.stat().st_size <= 0:
+            raise FileNotFoundError("ffmpeg 音频格式转换完成后未生成 mp3 文件。")
+        return target_path
+
+    def _normalize_video_for_mimo(self, video_path: Path) -> Path:
+        """Transcode B 站 video variants into a conservative Mimo-friendly MP4.
+
+        官方只承诺 MP4/MOV/AVI/WMV 这类容器，且明确不同格式变体不保证都可识别。
+        B 站视频常见 AV1、HEVC、分离音轨等组合，虽然文件后缀是 mp4，但多模态
+        网关仍可能报 corrupted。这里统一转成 H.264 + AAC + yuv420p，兼容性更稳。
+        """
+        target_path = video_path.with_name(f"{video_path.stem}_mimo.mp4")
+        if target_path.exists() and target_path.stat().st_size > 0:
+            return target_path
+        self._process_runner.run(
+            [
+                self._config.ffmpeg_bin,
+                "-y",
+                "-i",
+                str(video_path),
+                "-vf",
+                "scale='min(1280,iw)':-2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(target_path),
+            ],
+            timeout_seconds=VIDEO_NORMALIZE_TIMEOUT_SECONDS,
+        )
+        if not target_path.exists() or target_path.stat().st_size <= 0:
+            raise FileNotFoundError("ffmpeg 视频格式转换完成后未生成 Mimo 兼容 mp4 文件。")
+        return target_path
 
     def _build_ffmpeg_location_args(self) -> list[str]:
         """Return yt-dlp's ffmpeg location only when we have a concrete path.

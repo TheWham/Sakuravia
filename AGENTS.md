@@ -7,8 +7,10 @@
 - 提供本地网页
 - 手动输入 `BV` 号或 B 站视频链接
 - 优先读取字幕
-- 无字幕时下载音频并调用可切换 ASR，V3 默认使用阿里云百炼 `Paraformer`
-- 调用 `DeepSeek` 生成 Markdown 总结
+- V4 默认使用 Xiaomi Mimo：有官方字幕时把字幕文本和模板交给 Mimo 直接生成 Markdown
+- 无字幕时先下载音频并上传 OSS 签名 URL，让 Mimo 音频理解后按模板直接生成 Markdown
+- `MIMO_MEDIA_MODE=auto` 时，音频文件无效或 Mimo 明确无法识别有效语音，再回退视频 OSS URL + Mimo 视频理解
+- 保留 `DeepSeek` + 可切换 ASR 作为旧链路回退，但 V4 默认不调用 DeepSeek
 - 将 `.md` 文件落盘
 - 通过 `SMTP` 把 `.md` 作为附件发送到固定邮箱
 - 可选开启 B 站 AI 助手账号的 `@我` 通知监听，评论中带 BV/链接时自动创建或复用任务
@@ -35,9 +37,11 @@
   - `storage.py`：SQLite 持久化
   - `services/`
     - `bili.py`：BV 解析、视频元信息获取、字幕提取
-    - `audio.py`：音频下载与切片
+    - `audio.py`：音频下载、视频下载与音频切片
+    - `media.py`：OSS 临时媒体上传、签名 URL、音频有效性检测
+    - `mimo.py`：Xiaomi Mimo 文本/音频/视频理解并直接生成 Markdown
     - `transcription.py`：ASR Provider 分发、Groq Whisper 转写、阿里云百炼 Paraformer 转写
-    - `summary.py`：DeepSeek Markdown 总结
+    - `summary.py`：旧 DeepSeek Markdown 总结
     - `artifact.py`：Markdown 落盘
     - `mail.py`：SMTP 发信
     - `task_service.py`：任务编排与状态流转
@@ -55,9 +59,11 @@
 - 进程内 `ThreadPoolExecutor(max_workers=1)`
 - `yt-dlp`
 - `ffmpeg`
-- 阿里云百炼 `Paraformer`（默认 ASR，适合大陆阿里云部署）
+- Xiaomi Mimo（V4 默认总结与音/视频理解 Provider）
+- 阿里云 OSS 私有 Bucket + 签名 URL
+- 阿里云百炼 `Paraformer`（旧 ASR 回退链路，适合大陆阿里云部署）
 - `Groq Whisper`（保留为可切换旧 Provider）
-- `DeepSeek`
+- `DeepSeek`（保留为旧总结 Provider）
 - `SMTP`
 
 不要擅自切成这些替代方案：
@@ -74,10 +80,11 @@
 - `.env`
 - `yt-dlp`
 - `ffmpeg`
-- 阿里云百炼 API Key（`Paraformer` 需使用“中国内地（北京）”地域 API Key）
-- 阿里云 OSS Bucket（V3 默认私有 Bucket + 签名 URL 模式，识别完成后删除临时音频对象）
+- Xiaomi Mimo API Key
+- 阿里云 OSS Bucket（V4 默认私有 Bucket + 签名 URL 模式，Mimo 调用结束后删除临时音频/视频对象）
+- 可选：阿里云百炼 API Key（`Paraformer` 需使用“中国内地（北京）”地域 API Key）
 - 可选：Groq API Key
-- DeepSeek API Key
+- 可选：DeepSeek API Key
 - SMTP 账号
 - 可选：AI 助手 B 站账号 Cookie 和 `BILI_SELF_MID`
 
@@ -88,15 +95,19 @@
 - Markdown 输出目录默认在 `data/output/`
 - 音频目录默认在 `data/audio/`
 - 临时目录默认在 `data/tmp/`
-- ASR 默认 Provider 是 `aliyun_paraformer`；临时音频上传到 OSS 后通过短时签名 URL 交给百炼
-- `KEEP_AUDIO_AFTER_SUCCESS=false` 时，任务成功后删除本地音频；失败任务保留音频用于排查和重试
+- 总结默认 Provider 是 `mimo`；`MIMO_MEDIA_MODE=auto` 表示字幕优先、音频理解兜底、视频理解增强
+- 旧 ASR 默认 Provider 是 `aliyun_paraformer`；临时音频上传到 OSS 后通过短时签名 URL 交给百炼
+- `KEEP_AUDIO_AFTER_SUCCESS=false` 时，任务成功后删除本地音频/视频；失败任务保留本地媒体用于排查和重试
 
 ## 代码约束
 
 后续改动请继续遵守这些约束：
 
 - 关键业务方法保留详细但克制的注释和 docstring
-- 先保持“字幕优先，音频转写兜底”的处理顺序
+- V4 先保持“字幕优先，Mimo 音频理解兜底，视频理解可选增强”的处理顺序
+- `MIMO_MEDIA_MODE=auto|audio|video` 语义不能混淆；默认必须是 `auto`
+- Mimo 音频理解前要做音频有效性检测：文件存在、大小合理、ffprobe 有音频流、时长有效、音量不能长期接近静音
+- Mimo 音频返回无语音/无法识别有效内容时，`auto` 模式回退视频理解，`audio` 模式直接失败并落库可见
 - ASR Provider 必须可切换，不能把任务编排层绑定死到某一家服务商
 - Paraformer 结果 URL 有短期有效期，任务成功后要立即拉取 JSON 并保存文本，不能只保存结果 URL
 - 同一个 `bvid` 在运行中禁止重复创建新任务

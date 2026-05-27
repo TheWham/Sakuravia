@@ -19,6 +19,8 @@ from .services.bili import BiliResolverService
 from .services.bili_listener import BiliAuthService, BiliEventService, BiliHttpClient, BiliMentionApi, BiliMentionPoller
 from .services.http_client import SimpleHttpClient
 from .services.mail import MailService
+from .services.media import AudioProbeService, OssMediaStorage
+from .services.mimo import MimoSummaryService
 from .services.process_runner import ProcessExecutionError, ProcessRunner
 from .services.summary import SummaryService
 from .services.task_service import TaskService
@@ -59,6 +61,12 @@ def build_app() -> FastAPI:
     subtitle_audio_service = SubtitleOrAudioService(config, process_runner)
     transcription_service = TranscriptionService(config, http_client, subtitle_audio_service)
     summary_service = SummaryService(config, http_client)
+    mimo_summary_service = None
+    if config.summary_provider.strip().lower() == "mimo":
+        mimo_summary_service = MimoSummaryService(config, http_client, OssMediaStorage(config))
+    elif config.summary_provider.strip().lower() != "deepseek":
+        raise RuntimeError(f"不支持的 SUMMARY_PROVIDER：{config.summary_provider}")
+    audio_probe_service = AudioProbeService(config, process_runner)
     artifact_service = ArtifactService(config)
     mail_service = MailService(config)
     task_service = TaskService(
@@ -70,6 +78,9 @@ def build_app() -> FastAPI:
         artifact_service=artifact_service,
         mail_service=mail_service,
         keep_audio_after_success=config.keep_audio_after_success,
+        mimo_summary_service=mimo_summary_service,
+        audio_probe_service=audio_probe_service,
+        mimo_media_mode=config.mimo_media_mode,
     )
     task_service.recover_interrupted_tasks()
     bili_http_client = BiliHttpClient(config)

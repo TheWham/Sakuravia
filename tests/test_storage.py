@@ -9,6 +9,8 @@ from pathlib import Path
 
 from app.models import BiliDeliveryStatus, BiliEventStatus, MailStatus, SummaryResult, TaskStatus, TranscriptResult, VideoMetadata
 from app.storage import TaskRepository
+from app.services.media import InvalidAudioError
+from app.services.mimo import MimoNoValidAudioError
 from app.services.task_service import TaskService
 
 
@@ -355,6 +357,163 @@ class TaskServiceTests(unittest.TestCase):
         self.assertTrue(audio_service.last_audio_path.exists())
         self.assertEqual(final_task.audio_file_path, str(audio_service.last_audio_path))
 
+    def test_mimo_text_path_uses_official_subtitles_without_downloading_media(self) -> None:
+        task = self.repo.create_task("BV1text", "BV1text")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        mimo_service = FakeMimoSummaryService()
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=mimo_service,
+            audio_probe_service=FakeAudioProbeService(),
+            mimo_media_mode="auto",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "official_subtitle")
+        self.assertEqual(mimo_service.text_count, 1)
+        self.assertEqual(audio_service.download_audio_count, 0)
+        self.assertEqual(audio_service.download_video_count, 0)
+
+    def test_mimo_auto_uses_audio_when_audio_is_valid(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        mimo_service = FakeMimoSummaryService()
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=mimo_service,
+            audio_probe_service=FakeAudioProbeService(),
+            mimo_media_mode="auto",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "mimo_audio")
+        self.assertEqual(mimo_service.audio_count, 1)
+        self.assertEqual(mimo_service.video_count, 0)
+        self.assertEqual(audio_service.download_audio_count, 1)
+        self.assertEqual(audio_service.download_video_count, 0)
+        self.assertEqual(final_task.audio_file_path, "")
+
+    def test_mimo_auto_falls_back_to_video_when_local_audio_is_invalid(self) -> None:
+        task = self.repo.create_task("BV1video", "BV1video")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        mimo_service = FakeMimoSummaryService()
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=mimo_service,
+            audio_probe_service=FakeAudioProbeService(invalid_audio=True),
+            mimo_media_mode="auto",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "mimo_video")
+        self.assertEqual(mimo_service.audio_count, 0)
+        self.assertEqual(mimo_service.video_count, 1)
+        self.assertEqual(audio_service.download_audio_count, 1)
+        self.assertEqual(audio_service.download_video_count, 1)
+        self.assertFalse(audio_service.last_audio_path.exists())
+        self.assertFalse(audio_service.last_video_path.exists())
+
+    def test_mimo_audio_mode_fails_when_audio_is_invalid(self) -> None:
+        task = self.repo.create_task("BV1audio", "BV1audio")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=FakeMimoSummaryService(),
+            audio_probe_service=FakeAudioProbeService(invalid_audio=True),
+            mimo_media_mode="audio",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.FAILED)
+        self.assertIn("Mimo 音频理解不可用", final_task.error_message)
+        self.assertEqual(audio_service.download_video_count, 0)
+
+    def test_mimo_video_mode_skips_audio_download(self) -> None:
+        task = self.repo.create_task("BV1video", "BV1video")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        mimo_service = FakeMimoSummaryService()
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=mimo_service,
+            audio_probe_service=FakeAudioProbeService(),
+            mimo_media_mode="video",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "mimo_video")
+        self.assertEqual(audio_service.download_audio_count, 0)
+        self.assertEqual(audio_service.download_video_count, 1)
+        self.assertEqual(mimo_service.video_count, 1)
+
+    def test_mimo_auto_falls_back_to_video_when_mimo_rejects_audio_content(self) -> None:
+        task = self.repo.create_task("BV1reject", "BV1reject")
+        audio_service = FakeAudioService(Path(self.temp_dir.name))
+        mimo_service = FakeMimoSummaryService(audio_has_no_valid_content=True)
+        service = TaskService(
+            repository=self.repo,
+            bili_service=FakeBiliService(has_subtitle=False),
+            subtitle_audio_service=audio_service,
+            transcription_service=FakeTranscriptionService(),
+            summary_service=FakeSummaryService(),
+            artifact_service=FakeArtifactService(Path(self.temp_dir.name)),
+            mail_service=FakeMailService(),
+            mimo_summary_service=mimo_service,
+            audio_probe_service=FakeAudioProbeService(),
+            mimo_media_mode="auto",
+        )
+
+        service._process_task(task.id)
+        final_task = self.repo.get_task(task.id)
+
+        self.assertEqual(final_task.status, TaskStatus.SUCCESS)
+        self.assertEqual(final_task.subtitle_source, "mimo_video")
+        self.assertEqual(mimo_service.audio_count, 1)
+        self.assertEqual(mimo_service.video_count, 1)
+
 
 class FakeBiliService:
     """Simple stub that keeps the task flow deterministic in tests."""
@@ -391,10 +550,19 @@ class FakeAudioService:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.last_audio_path = self.root / "sample.m4a"
+        self.last_video_path = self.root / "sample.mp4"
+        self.download_audio_count = 0
+        self.download_video_count = 0
 
     def download_audio(self, metadata: VideoMetadata) -> Path:
+        self.download_audio_count += 1
         self.last_audio_path.write_bytes(b"test")
         return self.last_audio_path
+
+    def download_video(self, metadata: VideoMetadata) -> Path:
+        self.download_video_count += 1
+        self.last_video_path.write_bytes(b"video")
+        return self.last_video_path
 
     def split_audio(self, audio_path: Path, chunk_seconds: int = 600) -> list[Path]:
         return [audio_path]
@@ -434,6 +602,46 @@ class FakeSummaryService:
             ]
         )
         return SummaryResult(markdown=markdown, title=metadata.title, highlights=["要点一"])
+
+
+class FakeMimoSummaryService:
+    """Record which Mimo modality would have been used by the task flow."""
+
+    def __init__(self, audio_has_no_valid_content: bool = False) -> None:
+        self.audio_has_no_valid_content = audio_has_no_valid_content
+        self.text_count = 0
+        self.audio_count = 0
+        self.video_count = 0
+
+    def summarize_text(self, metadata: VideoMetadata, transcript: TranscriptResult) -> SummaryResult:
+        self.text_count += 1
+        return SummaryResult(markdown="# Mimo 字幕总结", title=metadata.title, highlights=[])
+
+    def summarize_audio(self, metadata: VideoMetadata, audio_path: Path) -> SummaryResult:
+        self.audio_count += 1
+        if self.audio_has_no_valid_content:
+            raise MimoNoValidAudioError("Mimo 认为音频没有有效语音")
+        return SummaryResult(markdown="# Mimo 音频总结", title=metadata.title, highlights=[])
+
+    def summarize_video(self, metadata: VideoMetadata, video_path: Path) -> SummaryResult:
+        self.video_count += 1
+        return SummaryResult(markdown="# Mimo 视频总结", title=metadata.title, highlights=[])
+
+
+class FakeAudioProbeService:
+    """Pretend to validate audio and video files without invoking ffprobe."""
+
+    def __init__(self, invalid_audio: bool = False, invalid_video: bool = False) -> None:
+        self.invalid_audio = invalid_audio
+        self.invalid_video = invalid_video
+
+    def ensure_valid_audio(self, audio_path: Path) -> None:
+        if self.invalid_audio:
+            raise InvalidAudioError("音频无效")
+
+    def ensure_valid_video(self, video_path: Path) -> None:
+        if self.invalid_video:
+            raise RuntimeError("视频无效")
 
 
 class FakeArtifactService:

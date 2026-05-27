@@ -74,6 +74,14 @@ class AppConfig:
     mail_to: str
     yt_dlp_cookies_file: Path | None = None
     keep_audio_after_success: bool = False
+    summary_provider: str = "mimo"
+    mimo_api_key: str = ""
+    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
+    mimo_model: str = "mimo-v2.5"
+    mimo_media_mode: str = "auto"
+    mimo_max_completion_tokens: int = 4096
+    mimo_video_fps: float = 1.0
+    mimo_video_resolution: str = "default"
     asr_provider: str = "aliyun_paraformer"
     aliyun_dashscope_api_key: str = ""
     aliyun_asr_model: str = "paraformer-v2"
@@ -123,6 +131,14 @@ class AppConfig:
             deepseek_base_url=_get_setting("DEEPSEEK_BASE_URL", file_values, "https://api.deepseek.com"),
             deepseek_api_key=_get_setting("DEEPSEEK_API_KEY", file_values),
             deepseek_model=_get_setting("DEEPSEEK_MODEL", file_values, "deepseek-chat"),
+            summary_provider=_get_setting("SUMMARY_PROVIDER", file_values, "mimo"),
+            mimo_api_key=_get_setting("MIMO_API_KEY", file_values),
+            mimo_base_url=_get_setting("MIMO_BASE_URL", file_values, "https://api.xiaomimimo.com/v1"),
+            mimo_model=_get_setting("MIMO_MODEL", file_values, "mimo-v2.5"),
+            mimo_media_mode=_get_setting("MIMO_MEDIA_MODE", file_values, "auto"),
+            mimo_max_completion_tokens=int(_get_setting("MIMO_MAX_COMPLETION_TOKENS", file_values, "4096")),
+            mimo_video_fps=float(_get_setting("MIMO_VIDEO_FPS", file_values, "1")),
+            mimo_video_resolution=_get_setting("MIMO_VIDEO_RESOLUTION", file_values, "default"),
             smtp_host=_get_setting("SMTP_HOST", file_values),
             smtp_port=int(_get_setting("SMTP_PORT", file_values, "465")),
             smtp_username=_get_setting("SMTP_USERNAME", file_values),

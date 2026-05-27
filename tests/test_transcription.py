@@ -201,7 +201,7 @@ class TranscriptionServiceTests(unittest.TestCase):
             storage.delete_audio(uploaded.object_key)
 
             self.assertEqual(uploaded.file_url, "https://signed.example.com/audio.m4a?expires=3600")
-            self.assertEqual(fake_bucket.uploaded_files, [(uploaded.object_key, str(audio_path))])
+            self.assertEqual(fake_bucket.uploaded_files, [(uploaded.object_key, str(audio_path), {"Content-Type": "audio/mp4"})])
             self.assertEqual(fake_bucket.signed_requests, [("GET", uploaded.object_key, 3600)])
             self.assertEqual(fake_bucket.deleted_keys, [uploaded.object_key])
 
@@ -290,13 +290,18 @@ class FakeOssBucket:
     """Small stand-in for oss2.Bucket when testing signed URL behavior."""
 
     def __init__(self) -> None:
-        self.uploaded_files: list[tuple[str, str]] = []
+        self.uploaded_files: list[tuple[str, str, dict[str, str]]] = []
         self.signed_requests: list[tuple[str, str, int]] = []
         self.deleted_keys: list[str] = []
 
-    def put_object_from_file(self, object_key: str, file_path: str) -> None:
+    def put_object_from_file(
+        self,
+        object_key: str,
+        file_path: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """Record the object key and source path instead of uploading."""
-        self.uploaded_files.append((object_key, file_path))
+        self.uploaded_files.append((object_key, file_path, headers or {}))
 
     def sign_url(self, method: str, object_key: str, expires: int) -> str:
         """Return a deterministic signed URL for assertions."""

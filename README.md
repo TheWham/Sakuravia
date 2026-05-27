@@ -1,10 +1,11 @@
-# 个人版 B 站 AI 助手 V3
+# 个人版 B 站 AI 助手 V4
 
 ## 功能
 
 - 输入 `BV` 号或 B 站视频链接，创建本地摘要任务
-- 优先读取字幕，无字幕时下载音频并调用可切换 ASR 转写，V3 默认阿里云百炼 Paraformer
-- 调用 DeepSeek 生成 Markdown 总结
+- 优先读取字幕，有字幕时直接把字幕和模板交给 Xiaomi Mimo 生成 Markdown
+- 无字幕时下载音频，上传 OSS 签名 URL 后交给 Mimo 音频理解直接生成 Markdown
+- `MIMO_MEDIA_MODE=auto` 时，音频无效或 Mimo 识别不到有效语音才回退视频理解
 - 将 Markdown 落盘，并作为邮件附件发送到固定邮箱
 - 页面内轮询显示任务状态和结果预览
 - 可选开启 B 站 AI 助手账号的 `@我` 通知监听，评论中包含 BV/视频链接时自动创建或复用总结任务
@@ -15,10 +16,11 @@
 - Python 3.11+
 - `yt-dlp`
 - `ffmpeg`
-- 可用的阿里云百炼 API Key（Paraformer 录音文件识别，需使用中国内地（北京）地域的 API Key）
-- 可用的阿里云 OSS Bucket（V3 默认用私有 Bucket + 签名 URL 让 Paraformer 读取临时音频）
+- 可用的 Xiaomi Mimo API Key
+- 可用的阿里云 OSS Bucket（V4 默认用私有 Bucket + 签名 URL 让 Mimo 读取临时音频/视频）
+- 可选：可用的阿里云百炼 API Key（当回退到旧 `SUMMARY_PROVIDER=deepseek` + ASR 链路时使用）
 - 可选：可用的 Groq API Key（当 `ASR_PROVIDER=groq` 时使用）
-- 可用的 DeepSeek API Key
+- 可选：可用的 DeepSeek API Key（当 `SUMMARY_PROVIDER=deepseek` 时使用）
 - 可用的 SMTP 账号
 - 可选：B 站 AI 助手账号 Cookie 和账号 MID，用于 V2 `@我` 监听
 
@@ -46,25 +48,52 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 - 后续买域名并解析到中国内地 ECS 前，先处理 ICP 备案和 HTTPS
 - 如果 ECS 上解析 B 站返回 `HTTP 412`，配置 `YT_DLP_COOKIES_FILE=data/bilibili-cookies.txt`
 
-## ASR 配置
+## Mimo V4 配置
 
-V3 默认使用阿里云百炼 `paraformer-v2`，适合部署在大陆阿里云服务器上。该模型不接受本地文件直传，系统会把无字幕视频的音频临时上传到私有 OSS Bucket，生成短时有效的签名 URL 提交给百炼，识别完成后尽量删除 OSS 临时对象。
+V4 默认使用 Xiaomi Mimo 统一完成理解和 Markdown 生成，减少“ASR 转写 -> DeepSeek 总结”的二次模型调用。默认策略是字幕优先、音频理解兜底、视频理解可选增强：
 
 ```dotenv
-ASR_PROVIDER=aliyun_paraformer
-ALIYUN_DASHSCOPE_API_KEY=中国内地（北京）地域的百炼 API Key
-ALIYUN_ASR_MODEL=paraformer-v2
+SUMMARY_PROVIDER=mimo
+MIMO_API_KEY=你的 Mimo API Key
+MIMO_BASE_URL=https://api.xiaomimimo.com/v1
+MIMO_MODEL=mimo-v2.5
+MIMO_MEDIA_MODE=auto
+MIMO_MAX_COMPLETION_TOKENS=4096
+MIMO_VIDEO_FPS=1
+MIMO_VIDEO_RESOLUTION=default
+```
+
+`MIMO_MEDIA_MODE` 支持三种模式：
+
+- `auto`：有官方字幕时直接用字幕；无字幕先走音频理解；音频文件异常、无音频流、时长为 0、长期接近静音，或 Mimo 返回无有效语音时，自动回退视频理解。
+- `audio`：有官方字幕时直接用字幕；无字幕只走音频理解。音频无效时任务失败并在页面显示原因，不自动跑视频。
+- `video`：有官方字幕时直接用字幕；无字幕直接走视频理解。适合软件操作教程、屏幕录制、AI 绘画 Prompt 展示、图表讲解等强画面视频。
+
+音频和视频都会临时上传到 OSS，通过短时签名 URL 提供给 Mimo。Mimo 调用结束后会尽量删除 OSS 临时对象。视频 URL 模式有文件大小限制，当前会在本地先拦截超过 300 MB 的视频；音频 URL 模式会拦截超过 100 MB 的音频。
+
+## OSS 与旧 ASR 配置
+
+V4 的 Mimo 媒体理解和旧 Paraformer ASR 都复用以下 OSS 配置。`ALIYUN_OSS_PUBLIC_BASE_URL` 留空时会使用签名 URL，Bucket 可以保持私有；只有你明确要用公共读 Bucket 时才填写这个公网域名。
+
+```dotenv
 ALIYUN_OSS_ACCESS_KEY_ID=
 ALIYUN_OSS_ACCESS_KEY_SECRET=
 ALIYUN_OSS_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
 ALIYUN_OSS_BUCKET=
 ALIYUN_OSS_PUBLIC_BASE_URL=
 ALIYUN_OSS_SIGNED_URL_EXPIRES_SECONDS=3600
+```
+
+如需临时切回旧的 ASR 链路，可以使用 DeepSeek 总结，并配置 ASR Provider：
+
+```dotenv
+SUMMARY_PROVIDER=deepseek
+ASR_PROVIDER=aliyun_paraformer
+ALIYUN_DASHSCOPE_API_KEY=中国内地（北京）地域的百炼 API Key
+ALIYUN_ASR_MODEL=paraformer-v2
 ALIYUN_ASR_POLL_INTERVAL_SECONDS=5
 ALIYUN_ASR_TIMEOUT_SECONDS=1800
 ```
-
-`ALIYUN_OSS_PUBLIC_BASE_URL` 留空时会使用签名 URL，Bucket 可以保持私有；只有你明确要用公共读 Bucket 时才填写这个公网域名。
 
 服务器磁盘较小时建议保留默认值：
 
@@ -72,7 +101,7 @@ ALIYUN_ASR_TIMEOUT_SECONDS=1800
 KEEP_AUDIO_AFTER_SUCCESS=false
 ```
 
-任务成功后会删除本地音频，失败任务仍会保留音频，方便重试和排查。
+任务成功后会删除本地音频/视频，失败任务仍会保留本地媒体，方便重试和排查。
 
 如需临时切回 Groq：
 
@@ -84,9 +113,9 @@ GROQ_ASR_MODEL=whisper-large-v3-turbo
 
 ## AI 总结模板
 
-V3 使用 DeepSeek 的 OpenAI 兼容接口生成 Markdown，总结模板在 `app/services/summary.py` 中维护。模板目标不是简单复述转写稿，而是把视频整理成适合手机邮箱阅读、可以长期收藏的中文笔记。
+V4 默认使用 Mimo 生成 Markdown，总结模板在 `app/services/summary.py` 和 `app/services/mimo.py` 中维护。模板目标不是简单复述转写稿，而是把视频整理成适合手机邮箱阅读、可以长期收藏的中文笔记。
 
-### DeepSeek 配置模板
+### 旧 DeepSeek 配置模板
 
 ```dotenv
 DEEPSEEK_BASE_URL=https://api.deepseek.com
@@ -94,9 +123,9 @@ DEEPSEEK_API_KEY=你的 DeepSeek API Key
 DEEPSEEK_MODEL=deepseek-chat
 ```
 
-### 单段视频总结模板
+### 单段字幕总结模板
 
-当转写内容较短时，系统会把视频元信息和完整转写一次性提交给 DeepSeek。模板要求如下：
+当视频有官方字幕时，系统会把视频元信息和完整字幕提交给 Mimo。模板要求如下：
 
 ```text
 系统角色：
@@ -158,9 +187,9 @@ UP主：{uploader}
 {transcript}
 ```
 
-### 长视频合并模板
+### 旧 DeepSeek 长文本合并模板
 
-转写内容较长时，系统会先按段生成局部笔记，再把多段笔记合并成最终 Markdown。合并模板关注去重、保留事实、统一结构：
+旧 DeepSeek 链路的转写内容较长时，系统会先按段生成局部笔记，再把多段笔记合并成最终 Markdown。合并模板关注去重、保留事实、统一结构：
 
 ```text
 请将同一个视频的多段笔记合并成一份最终 Markdown 邮件正文。
@@ -187,7 +216,7 @@ UP主：{uploader}
 
 ## 邮箱模板
 
-V3 邮件由 `app/services/mail.py` 生成。系统会同时发送纯文本正文、HTML 正文和 Markdown 附件，避免不同邮箱客户端显示不一致时看不到完整内容。
+V4 邮件由 `app/services/mail.py` 生成。系统会同时发送纯文本正文、HTML 正文和 Markdown 附件，避免不同邮箱客户端显示不一致时看不到完整内容。
 
 ### SMTP 配置模板
 
@@ -266,7 +295,7 @@ BILI_REQUEST_TIMEOUT_SECONDS=15
 
 开启后重启服务。别人评论里 `@AI助手账号 BVxxxx` 或 `@AI助手账号 https://www.bilibili.com/video/BV...` 时，系统会在本地记录事件并创建或复用任务。邮件收件人来自本地“用户邮箱簿”中该评论用户 UID 对应的邮箱；未绑定邮箱的用户不会创建任务。当前版本只发邮件和本地展示，不自动回复 B 站评论。
 
-为降低风控风险，V3 默认不再使用固定 60 秒轮询，而是在 `BILI_POLL_MIN_SECONDS` 到 `BILI_POLL_MAX_SECONDS` 之间随机等待。推荐保持 `180-480` 秒，@ 触发会有 3-8 分钟延迟，但更适合长期常开。旧配置 `BILI_POLL_INTERVAL_SECONDS` 仍兼容；如果没有配置新的最小/最大值，系统会把旧值当作固定轮询间隔。
+为降低风控风险，当前版本默认不再使用固定 60 秒轮询，而是在 `BILI_POLL_MIN_SECONDS` 到 `BILI_POLL_MAX_SECONDS` 之间随机等待。推荐保持 `180-480` 秒，@ 触发会有 3-8 分钟延迟，但更适合长期常开。旧配置 `BILI_POLL_INTERVAL_SECONDS` 仍兼容；如果没有配置新的最小/最大值，系统会把旧值当作固定轮询间隔。
 
 监听器还会做保护性退避：普通网络异常会自动降频重试；连续失败过多，或遇到 `412`、`429`、验证码、访问受限、Cookie 失效等疑似风控/账号异常信号时，会自动暂停监听并在页面显示原因，避免继续请求 B 站。
 
@@ -282,6 +311,6 @@ python -m unittest discover -s tests -v
 
 本项目采用 Apache License 2.0。你可以在遵守该协议的前提下使用、复制、修改和分发本项目。
 
-本项目会调用 B 站、Groq、DeepSeek、SMTP 等第三方服务，实际使用时仍需自行遵守对应平台的服务条款和风控规则。
+本项目会调用 B 站、Xiaomi Mimo、阿里云 OSS、Groq、DeepSeek、SMTP 等第三方服务，实际使用时仍需自行遵守对应平台的服务条款和风控规则。
 
 完整条款见 [LICENSE](LICENSE)。

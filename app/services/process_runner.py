@@ -5,11 +5,20 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class ProcessExecutionError(RuntimeError):
     """Raised when an external command exits with a non-zero status."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessResult:
+    """Captured output from an external command."""
+
+    stdout: str
+    stderr: str
 
 
 class ProcessRunner:
@@ -25,6 +34,20 @@ class ProcessRunner:
         外部命令是整条链路里最容易“无声卡住”的部分，例如 yt-dlp 等待网络、
         ffmpeg 等待文件句柄释放。这里统一加超时和耗时日志，业务服务只关心
         成功输出或明确失败原因。
+        """
+        return self.run_with_result(args, cwd, timeout_seconds).stdout
+
+    def run_with_result(
+        self,
+        args: list[str],
+        cwd: Path | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ProcessResult:
+        """Execute a command and keep both stdout and stderr.
+
+        ffmpeg/ffprobe 这类工具经常把诊断信息写到 stderr，但退出码仍然是 0。
+        音频有效性检测需要读取这些信息，所以这里保留完整输出；原有 `run`
+        继续只返回 stdout，避免影响依赖 stdout JSON 的调用方。
         """
         timeout = timeout_seconds or self._default_timeout_seconds
         started_at = time.monotonic()
@@ -52,4 +75,4 @@ class ProcessRunner:
             self._logger.error("%s failed after %.1fs: %s", command_name, elapsed, message[:500])
             raise ProcessExecutionError(message)
         self._logger.warning("%s finished in %.1fs", command_name, elapsed)
-        return result.stdout
+        return ProcessResult(stdout=result.stdout, stderr=result.stderr)

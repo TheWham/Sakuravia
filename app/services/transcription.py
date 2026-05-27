@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import quote
 
 from ..config import AppConfig
 from ..models import TranscriptResult
 from .audio import SubtitleOrAudioService
 from .http_client import HttpRequestError, SimpleHttpClient
+from .media import OssMediaStorage, UploadedMedia
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,12 +24,7 @@ class AudioTranscriptionProvider(Protocol):
         """Return plain transcript text for one local audio file."""
 
 
-@dataclass(frozen=True, slots=True)
-class UploadedAudio:
-    """OSS object metadata needed by Paraformer and later cleanup."""
-
-    object_key: str
-    file_url: str
+UploadedAudio = UploadedMedia
 
 
 class PublicAudioStorage(Protocol):
@@ -45,7 +37,7 @@ class PublicAudioStorage(Protocol):
         """Remove the temporary audio object after recognition finishes."""
 
 
-class OssAudioStorage:
+class OssAudioStorage(OssMediaStorage):
     """Store temporary ASR audio in OSS and expose a short-lived read URL.
 
     Paraformer only accepts reachable URLs. The safer default is a private
@@ -53,64 +45,13 @@ class OssAudioStorage:
     compatibility when the user intentionally uses a public-read bucket.
     """
 
-    def __init__(self, config: AppConfig) -> None:
-        self._config = config
-        self._bucket = None
-
     def upload_audio(self, file_path: Path) -> UploadedAudio:
         """Upload one local audio file to OSS and build the URL given to ASR."""
-        self._validate_config()
-        object_key = self._build_object_key(file_path)
-        bucket = self._get_bucket()
-        bucket.put_object_from_file(object_key, str(file_path))
-        return UploadedAudio(object_key=object_key, file_url=self._build_file_url(bucket, object_key))
+        return self.upload_file(file_path, "asr")
 
     def delete_audio(self, object_key: str) -> None:
         """Delete one temporary OSS object if it was uploaded for ASR."""
-        if object_key:
-            self._get_bucket().delete_object(object_key)
-
-    def _get_bucket(self):
-        """Create the OSS client lazily so unit tests do not need the SDK."""
-        if self._bucket is not None:
-            return self._bucket
-
-        try:
-            import oss2
-        except ImportError as exc:  # pragma: no cover - exercised only without dependency installed.
-            raise RuntimeError("缺少 oss2 依赖，请先安装 requirements.txt。") from exc
-
-        auth = oss2.Auth(self._config.aliyun_oss_access_key_id, self._config.aliyun_oss_access_key_secret)
-        self._bucket = oss2.Bucket(auth, self._config.aliyun_oss_endpoint, self._config.aliyun_oss_bucket)
-        return self._bucket
-
-    def _validate_config(self) -> None:
-        """Fail early when OSS upload or URL generation is not fully configured."""
-        missing = []
-        for name, value in {
-            "ALIYUN_OSS_ACCESS_KEY_ID": self._config.aliyun_oss_access_key_id,
-            "ALIYUN_OSS_ACCESS_KEY_SECRET": self._config.aliyun_oss_access_key_secret,
-            "ALIYUN_OSS_ENDPOINT": self._config.aliyun_oss_endpoint,
-            "ALIYUN_OSS_BUCKET": self._config.aliyun_oss_bucket,
-        }.items():
-            if not value:
-                missing.append(name)
-        if missing:
-            raise RuntimeError(f"阿里云 OSS 临时音频上传缺少配置：{', '.join(missing)}")
-
-    def _build_object_key(self, file_path: Path) -> str:
-        """Keep temporary audio grouped by date for easier OSS lifecycle cleanup."""
-        date_part = datetime.now().strftime("%Y%m%d")
-        safe_name = file_path.name.replace("\\", "_").replace("/", "_")
-        return f"asr/{date_part}/{uuid.uuid4().hex}/{safe_name}"
-
-    def _build_file_url(self, bucket, object_key: str) -> str:
-        """Prefer a signed URL so the Bucket can stay private."""
-        public_base_url = self._config.aliyun_oss_public_base_url.strip()
-        if public_base_url:
-            return f"{public_base_url.rstrip('/')}/{quote(object_key, safe='/')}"
-        expires = max(60, self._config.aliyun_oss_signed_url_expires_seconds)
-        return bucket.sign_url("GET", object_key, expires)
+        self.delete_file(object_key)
 
 
 class GroqWhisperProvider:
